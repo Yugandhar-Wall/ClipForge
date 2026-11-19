@@ -397,26 +397,54 @@ def on_layout(layout, frame, picker, zoom, logo, logo_size):
 
 
 def on_mode(mode):
+    """Video and Live show only the settings they use ("Clips per video" and Top-N are Video
+    only: Live uses "Most clips per check" instead)."""
     video, live = mode == "video", mode == "live"
     return (gr.update(visible=video), gr.update(visible=live), gr.update(visible=video),
             gr.update(visible=live),
-            gr.update(value="▶  Start watching" if live else "▶  Start clipping"))
+            gr.update(value="▶  Start watching" if live else "▶  Start clipping"),
+            gr.update(visible=video))
+
+
+def clip_hints(mode, n_clips, top_n_on, max_len, formats):
+    """Warnings for settings that would silently do nothing: (Clips card note, formats note)."""
+    clips = ""
+    if mode == "video" and top_n_on and int(n_clips) < 3:
+        clips = (f"⚠️ The Top-N countdown needs at least 3 clips per video: with {int(n_clips)} "
+                 "it won't be made.")
+    fmt = ""
+    if "two_part" in (formats or []) and int(max_len) < 30:
+        fmt = (f"⚠️ two_part needs moments of 30 s or more, and Max seconds is {int(max_len)}: "
+               "it won't be used.")
+    return gr.update(value=clips, visible=bool(clips)), gr.update(value=fmt, visible=bool(fmt))
+
+
+def on_min_len(lo, hi):
+    """Min can't pass Max: Max follows."""
+    return gr.update(value=lo) if int(lo) > int(hi) else gr.update()
+
+
+def on_max_len(hi, lo):
+    """Max can't go under Min: Min follows."""
+    return gr.update(value=hi) if int(hi) < int(lo) else gr.update()
 
 
 # ---------------------------------------------------------------- small handlers
 def on_logo(path, frame, picker, layout, zoom, logo_size):
     if not path:
-        return gr.update(), gr.update(), "No file.", gr.update()
+        return gr.update(), gr.update(), "No file.", gr.update(), gr.update()
     try:
         stored = store_logo(path)
     except Exception as e:
-        return gr.update(), gr.update(), f"Couldn't read that image: {e}", gr.update()
-    return stored, stored, "Logo added for this run.", refresh_preview(frame, picker, layout, zoom, stored, logo_size)
+        return gr.update(), gr.update(), f"Couldn't read that image: {e}", gr.update(), gr.update()
+    return (stored, stored, "Logo added for this run.",
+            refresh_preview(frame, picker, layout, zoom, stored, logo_size), gr.update(visible=True))
 
 
 def on_remove_logo(frame, picker, layout, zoom, logo_size):
     remove_logo()
-    return None, "", "Logo removed.", refresh_preview(frame, picker, layout, zoom, "", logo_size)
+    return (None, "", "Logo removed.", refresh_preview(frame, picker, layout, zoom, "", logo_size),
+            gr.update(visible=False))
 
 
 def on_rules_file(path):
@@ -514,7 +542,7 @@ def make_new_session(w, order):
     def new_session():
         if _busy():
             gr.Warning("A run is still going: press Stop first.")
-            return [gr.update() for _ in order] + list(view(""))
+            return [gr.update() for _ in order] + list(view("")) + [gr.update()]
         RUN["job"], RUN["kind"] = None, None
         LIVE.forget()
         try:
@@ -527,7 +555,8 @@ def make_new_session(w, order):
                  "picker": "", "frame": None, "layout_preview": gr.update(value=None, visible=False),
                  "frame_msg": ""}
         gr.Info("New session: everything from the last run is cleared.")
-        return [blank[k] if k in blank else gr.update() for k in order] + list(view("refresh"))
+        return ([blank[k] if k in blank else gr.update() for k in order] + list(view("refresh"))
+                + [gr.update(visible=False)])
     return new_session
 
 
@@ -629,12 +658,16 @@ def build():
 
                         with card("Clips", "How many and how long.", step=3):
                             with gr.Row():
-                                w["n_clips"] = gr.Slider(1, 30, value=s["n_clips"], step=1, label="Clips per video")
-                                w["min_len"] = gr.Slider(8, 60, value=s["min_len"], step=1, label="Min seconds")
-                                w["max_len"] = gr.Slider(15, 180, value=s["max_len"], step=1, label="Max seconds")
+                                w["n_clips"] = gr.Slider(1, 30, value=s["n_clips"], step=1, label="Clips per video", elem_id="cf-n-clips",
+                                                         visible=mode == "video")
+                                w["min_len"] = gr.Slider(8, 60, value=s["min_len"], step=1, label="Min seconds", elem_id="cf-min-len")
+                                w["max_len"] = gr.Slider(15, 180, value=s["max_len"], step=1, label="Max seconds", elem_id="cf-max-len")
                             with gr.Row(visible=mode == "video") as topn_row:
-                                w["top_n_on"] = gr.Checkbox(label="Also make a Top-N countdown", value=s["top_n_on"])
-                                w["top_n"] = gr.Slider(3, 10, value=s["top_n"], step=1, label="N")
+                                w["top_n_on"] = gr.Checkbox(label="Also make a Top-N countdown", value=s["top_n_on"],
+                                                            elem_id="cf-topn-on")
+                                w["top_n"] = gr.Slider(3, 10, value=s["top_n"], step=1, visible=s["top_n_on"],
+                                                       label="N (at most the number of clips made)", elem_id="cf-topn")
+                            clips_note = gr.Markdown(visible=False, elem_classes="cf-note", elem_id="cf-clips-note")
                             with gr.Column(visible=mode == "live") as live_opts:
                                 with gr.Row():
                                     w["live_interval"] = gr.Slider(2, 15, value=s["live_interval"], step=1,
@@ -652,6 +685,7 @@ def build():
                         with gr.Accordion("🎨  Style: formats, captions, sound, motion", open=False, elem_classes="cf-acc"):
                             w["formats"] = gr.CheckboxGroup(list(FORMATS), value=s["formats"],
                                                             label="Edit formats the AI may use (it picks per clip and keeps them varied)")
+                            formats_note = gr.Markdown(visible=False, elem_classes="cf-note", elem_id="cf-formats-note")
                             with gr.Row():
                                 w["highlight"] = gr.Dropdown(HIGHLIGHTS, value=s["highlight"],
                                                              label="Caption highlight (auto = varies per clip)")
@@ -662,8 +696,9 @@ def build():
                                 w["progress_on"] = gr.Checkbox(label="Progress bar", value=s["progress_on"])
                                 w["punch_on"] = gr.Checkbox(label="Punch-in zooms", value=s["punch_on"])
                             with gr.Row():
-                                w["sfx_on"] = gr.Checkbox(label="Sound effects", value=s["sfx_on"])
-                                w["sfx_gain"] = gr.Slider(0.1, 1.2, value=s["sfx_gain"], step=0.05, label="SFX volume")
+                                w["sfx_on"] = gr.Checkbox(label="Sound effects", value=s["sfx_on"], elem_id="cf-sfx-on")
+                                w["sfx_gain"] = gr.Slider(0.1, 1.2, value=s["sfx_gain"], step=0.05, label="SFX volume", elem_id="cf-sfx-gain",
+                                                          visible=s["sfx_on"])
                             with gr.Row():
                                 w["meme_on"] = gr.Checkbox(label="Trending meme sounds", value=s["meme_on"])
                                 w["meme_gain"] = gr.Slider(0.2, 1.5, value=s["meme_gain"], step=0.05,
@@ -673,7 +708,8 @@ def build():
                             w["motion_on"] = gr.Checkbox(label="Animated hooks, cards and stickers (motion graphics)",
                                                          value=s["motion_on"])
                             w["motion_elements"] = gr.CheckboxGroup(
-                                [(v, k) for k, v in MOTION_ELEMENTS.items()], value=s["motion_elements"],
+                                [(v + (" (Top-N only)" if k == "countdown" else ""), k)
+                                 for k, v in MOTION_ELEMENTS.items()], value=s["motion_elements"],
                                 label="Animate", visible=s["motion_on"])
                             motion_msg = gr.Markdown(motion_status() if s["motion_on"] else "",
                                                      visible=s["motion_on"], elem_classes="cf-note")
@@ -685,12 +721,13 @@ def build():
                                                          file_types=["image"], type="filepath", height=120)
                                 w["logo_preview"] = gr.Image(label="Current logo", interactive=False, height=120)
                             w["logo_state"] = gr.State("")
-                            with gr.Row():
-                                w["logo_anim"] = gr.Radio(ANIMATIONS, value=s["logo_anim"], label="Logo animation")
-                                w["logo_size"] = gr.Slider(0.5, 1.6, value=s["logo_size"], step=0.05, label="Logo size")
-                            with gr.Row():
+                            w["logo_msg"] = gr.Markdown(elem_classes="cf-note")
+                            with gr.Column(visible=False, elem_id="cf-logo-opts") as logo_opts:     # only once a logo is added
+                                with gr.Row():
+                                    w["logo_anim"] = gr.Radio(ANIMATIONS, value=s["logo_anim"], label="Logo animation")
+                                    w["logo_size"] = gr.Slider(0.5, 1.6, value=s["logo_size"], step=0.05,
+                                                               label="Logo size")
                                 remove_btn = gr.Button("Remove logo", size="sm", variant="secondary")
-                                w["logo_msg"] = gr.Markdown(elem_classes="cf-note")
                             w["rules_file"] = gr.File(label="Campaign rules file (.txt .md .pdf .docx)",
                                                       file_types=[".txt", ".md", ".pdf", ".docx"], type="filepath",
                                                       height=110)
@@ -732,7 +769,7 @@ def build():
                             w["yt_mode"] = gr.Radio([("Private: I review and publish", "review"),
                                                      ("Scheduled: goes public automatically", "scheduled")],
                                                     value=s["yt_mode"], label="After upload")
-                            with gr.Row():
+                            with gr.Row(visible=s["yt_mode"] == "scheduled", elem_id="cf-sched") as sched_row:
                                 w["yt_interval"] = gr.Slider(1, 120, value=s["yt_interval"], step=1,
                                                              label="Minutes between videos (scheduled)")
                                 w["yt_first_delay"] = gr.Slider(0, 240, value=s["yt_first_delay"], step=5,
@@ -769,13 +806,15 @@ def build():
                         with card("AI"):
                             w["api_key"] = gr.Textbox(label="OpenRouter API key", value=s["api_key"], type="password")
                             w["model"] = gr.Textbox(label="Model ('auto' = cheapest that works)", value=s["model"])
-                            w["allow_free"] = gr.Checkbox(label="Try free models first", value=s["allow_free"])
+                            w["allow_free"] = gr.Checkbox(label="Try free models first (only used when Model is 'auto')",
+                                                          value=s["allow_free"])
                         with card("Transcription"):
-                            w["whisper_model"] = gr.Dropdown(STT_CHOICES, value=s["whisper_model"], label="Engine",
+                            w["whisper_model"] = gr.Dropdown(STT_CHOICES, value=s["whisper_model"], label="Engine", elem_id="cf-stt",
                                                              info="Cloud costs about $0.03-0.22 per hour of audio; local is free but slow.")
                             with gr.Row():
                                 w["fallback_model"] = gr.Dropdown(LOCAL_MODELS, value=s.get("fallback_model") or "small",
-                                                                  label="If cloud fails, use local model")
+                                                                  label="If cloud fails, use local model", elem_id="cf-fallback",
+                                                                  visible=str(s["whisper_model"]).startswith("cloud:"))
                                 w["language"] = gr.Textbox(label="Language (blank = auto, e.g. en, hi)", value=s["language"])
                         ai_save = gr.Button("Save AI and transcription settings", size="sm", variant="secondary")
                         with card("Storage", "Everything ClipForge makes is temporary."):
@@ -810,7 +849,19 @@ def build():
         timer.tick(view, [seen], run_out, show_progress="hidden")
         ui.load(lambda: view(""), None, run_out, show_progress="hidden")
 
-        w["mode"].change(on_mode, [w["mode"]], [video_src, live_src, topn_row, live_opts, start_btn])
+        w["mode"].change(on_mode, [w["mode"]], [video_src, live_src, topn_row, live_opts, start_btn, w["n_clips"]])
+        hint_in = [w["mode"], w["n_clips"], w["top_n_on"], w["max_len"], w["formats"]]
+        for comp in hint_in:
+            comp.change(clip_hints, hint_in, [clips_note, formats_note], show_progress="hidden")
+        w["min_len"].change(on_min_len, [w["min_len"], w["max_len"]], [w["max_len"]], show_progress="hidden")
+        w["max_len"].change(on_max_len, [w["max_len"], w["min_len"]], [w["min_len"]], show_progress="hidden")
+        w["top_n_on"].change(lambda on: gr.update(visible=on), [w["top_n_on"]], [w["top_n"]], show_progress="hidden")
+        w["sfx_on"].change(lambda on: gr.update(visible=on), [w["sfx_on"]], [w["sfx_gain"]], show_progress="hidden")
+        w["yt_mode"].change(lambda m: gr.update(visible=m == "scheduled"), [w["yt_mode"]], [sched_row],
+                            show_progress="hidden")
+        w["whisper_model"].change(lambda m: gr.update(visible=str(m).startswith("cloud:")), [w["whisper_model"]],
+                                  [w["fallback_model"]], show_progress="hidden")
+        ui.load(clip_hints, hint_in, [clips_note, formats_note], show_progress="hidden")
         w["mode"].change(lambda m: update_settings(mode=m), [w["mode"]], None)
         prev_in = [w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_state"], w["logo_size"]]
         w["layout"].change(on_layout, [w["layout"], w["frame"], w["picker"], w["zoom"], w["logo_state"], w["logo_size"]],
@@ -825,15 +876,15 @@ def build():
         w["logo_size"].release(refresh_preview, prev_in, [w["layout_preview"]], show_progress="hidden")
 
         w["logo_file"].upload(on_logo, [w["logo_file"], w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_size"]],
-                              [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"]])
+                              [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"], logo_opts])
         remove_btn.click(on_remove_logo, [w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_size"]],
-                         [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"]])
+                         [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"], logo_opts])
         w["rules_file"].upload(on_rules_file, [w["rules_file"]], [w["rules_text"], w["rules_msg"]])
         w["motion_on"].change(on_motion, [w["motion_on"]], [w["motion_elements"], motion_msg])
         w["meme_on"].change(on_meme, [w["meme_on"]], [w["meme_gain"], meme_msg])
 
         order = list(w)
-        new_btn.click(make_new_session(w, order), None, [w[k] for k in order] + run_out)
+        new_btn.click(make_new_session(w, order), None, [w[k] for k in order] + run_out + [logo_opts])
 
         yt_keys = ["yt_on"] + YT_KEYS
         yt_save.click(lambda *v: save_prefs(*v, keys=yt_keys), [w[k] for k in yt_keys], None).then(
