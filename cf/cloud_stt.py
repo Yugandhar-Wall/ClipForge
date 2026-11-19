@@ -14,7 +14,6 @@ Why it is built this way:
 import base64
 import os
 import re
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,7 +22,7 @@ import requests
 
 from .audio import SPEECH_SR, STT_PROMPT, read_speech
 from .llm import API, headers
-from .tools import CACHE_DIR, ffmpeg_exe, read_json, write_json
+from .tools import CACHE_DIR, check_stop, ffmpeg_exe, in_scope, read_json, run_cmd, stoppable, write_json
 
 URL = f"{API}/audio/transcriptions"
 MODELS = ["openai/whisper-large-v3", "openai/whisper-large-v3-turbo"]
@@ -71,7 +70,7 @@ def _encode(wav, s, e):
     base = [ffmpeg_exe(), "-v", "error", "-ss", f"{s:.2f}", "-t", f"{e - s:.2f}", "-i", wav, "-ac", "1"]
     for args, fmt in ((["-c:a", "libmp3lame", "-b:a", "48k", "-f", "mp3"], "mp3"),
                       (["-c:a", "flac", "-f", "flac"], "flac")):
-        p = subprocess.run(base + args + ["-"], capture_output=True)
+        p = run_cmd(base + args + ["-"], binary=True)
         if p.returncode == 0 and p.stdout:
             return p.stdout, fmt
     raise CloudSTTError("ffmpeg couldn't encode audio for upload")
@@ -86,7 +85,7 @@ def _request(key, model, data, fmt, language):
     last = None
     for attempt in range(4):
         try:
-            r = requests.post(URL, json=body, headers=headers(key), timeout=180)
+            r = stoppable(requests.post, URL, json=body, headers=headers(key), timeout=180)
         except requests.RequestException as e:
             last = f"network error: {e}"
         else:
@@ -200,6 +199,7 @@ def transcribe_cloud(wav, api_key, model=MODELS[0], language=None, log=print, ca
         f"{f' ({len(chunks) - len(todo)} silent skipped)' if len(chunks) > len(todo) else ''}...")
 
     def one(job):
+        check_stop()
         i, s, e = job
         pc = os.path.join(CACHE_DIR, f"{cache_key or 'nokey'}_cloud-{tag}_{i:03d}_{int(s)}.json")
         if os.path.exists(pc):
@@ -214,7 +214,7 @@ def transcribe_cloud(wav, api_key, model=MODELS[0], language=None, log=print, ca
 
     results, done, cost, t0 = {}, 0, 0.0, time.time()
     with ThreadPoolExecutor(WORKERS) as ex:
-        for i, resp, cached in ex.map(one, todo):
+        for i, resp, cached in ex.map(in_scope(one), todo):
             results[i] = resp
             done += 1
             if not cached:

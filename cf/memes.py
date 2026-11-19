@@ -10,12 +10,11 @@
 import hashlib
 import os
 import re
-import subprocess
 import wave
 
 import numpy as np
 
-from .tools import CACHE_DIR, ROOT, ffmpeg_exe, read_json, write_json
+from .tools import CACHE_DIR, ROOT, ffmpeg_exe, read_json, run_cmd, write_json
 
 SOUNDS_DIR = os.path.join(ROOT, "sounds")
 CATALOG = os.path.join(SOUNDS_DIR, "sounds.txt")
@@ -47,8 +46,11 @@ def _descriptions():
 
 
 def _decode(path):
-    raw = subprocess.run([ffmpeg_exe(), "-v", "error", "-i", path, "-t", str(MAX_LEN), "-f", "f32le",
-                          "-ac", "2", "-ar", str(SR), "-"], capture_output=True, check=True).stdout
+    p = run_cmd([ffmpeg_exe(), "-v", "error", "-i", path, "-t", str(MAX_LEN), "-f", "f32le",
+                 "-ac", "2", "-ar", str(SR), "-"], binary=True)
+    if p.returncode != 0:
+        raise ValueError(p.stderr.decode("utf-8", "replace").strip()[-200:] or "ffmpeg couldn't read it")
+    raw = p.stdout
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).copy()
 
 

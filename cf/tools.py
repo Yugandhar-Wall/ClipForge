@@ -1,10 +1,14 @@
-"""Shared helpers: app folders, ffmpeg (find, run, probe), Node.js, JSON files, time formats."""
+"""Shared helpers: app folders, stopping a run, ffmpeg (find, run, probe), Node.js, JSON files,
+time formats."""
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SFX_DIR = os.path.join(ROOT, "sfx")
@@ -19,6 +23,110 @@ NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW: n
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 _FFMPEG = None
+
+
+# ---------------------------------------------------------------- stopping a run
+# A run (a Create job, or one live check) executes inside stop_scope(event). Everything slow
+# below it calls check_stop() between steps, runs commands with run_cmd() and blocking network
+# calls with stoppable(), so pressing Stop (setting the event) ends the run within about a second.
+class Cancelled(BaseException):
+    """The user pressed Stop. A BaseException (like KeyboardInterrupt) so that the many
+    "never let X break the run" `except Exception` handlers don't swallow it."""
+
+
+_scope = threading.local()
+
+
+@contextlib.contextmanager
+def stop_scope(event):
+    prev = getattr(_scope, "event", None)
+    _scope.event = event
+    try:
+        yield
+    finally:
+        _scope.event = prev
+
+
+def stop_event():
+    """The Stop event of the run this thread works for (None outside a run)."""
+    return getattr(_scope, "event", None)
+
+
+def stop_requested():
+    ev = stop_event()
+    return ev is not None and ev.is_set()
+
+
+def check_stop():
+    if stop_requested():
+        raise Cancelled("Stopped.")
+
+
+def pause(seconds):
+    """time.sleep that ends early (with Cancelled) on Stop."""
+    ev = stop_event()
+    if ev is None:
+        time.sleep(seconds)
+    elif ev.wait(seconds):
+        raise Cancelled("Stopped.")
+
+
+def in_scope(fn):
+    """Wrap fn so it runs inside the calling thread's stop scope (for worker threads)."""
+    ev = stop_event()
+
+    def run(*a, **k):
+        with stop_scope(ev):
+            return fn(*a, **k)
+    return run
+
+
+def stoppable(fn, *a, **k):
+    """Run a blocking call (HTTP request, metadata lookup) so Stop doesn't wait for it: on Stop it
+    is abandoned in the background and Cancelled is raised at once."""
+    ev = stop_event()
+    if ev is None:
+        return fn(*a, **k)
+    check_stop()
+    box = {}
+
+    def run():
+        try:
+            with stop_scope(ev):
+                box["value"] = fn(*a, **k)
+        except BaseException as e:   # handed to the caller below
+            box["error"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(0.25)
+        if ev.is_set():
+            raise Cancelled("Stopped.")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def run_cmd(cmd, cwd=None, timeout=None, env=None, binary=False):
+    """subprocess.run(capture_output=True) that is killed on Stop (and after `timeout` seconds).
+    Text output unless binary=True. Returns a CompletedProcess."""
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         creationflags=NO_WINDOW,
+                         **({} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}))
+    waited = 0.0
+    while True:
+        try:
+            out, err = p.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            waited += 0.5
+            if stop_requested() or (timeout is not None and waited >= timeout):
+                p.kill()
+                p.communicate()
+                if stop_requested():
+                    raise Cancelled("Stopped.") from None
+                raise subprocess.TimeoutExpired(cmd, timeout) from None
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 # ---------------------------------------------------------------- small helpers
@@ -120,9 +228,7 @@ def is_hls(url):
 
 
 def run_ffmpeg(args, cwd=None, log=None):
-    cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y"] + args
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    p = run_cmd([ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y"] + args, cwd=cwd)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + (p.stderr or "")[-2000:])
     return p

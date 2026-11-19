@@ -27,3 +27,4 @@ sounds/*.wav
 *.mp4
 *.lnk
 motion/ready.json
+*.bundle

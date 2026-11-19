@@ -24,7 +24,7 @@ from .llm import chat_json, est_tokens
 from .render import H, layout_geometry, render_timeline
 from .settings import DEFAULTS
 from .signals import annotate, find_signals, hot_spots
-from .tools import CACHE_DIR, OUTPUT_DIR, fmt_ts, parse_ts, probe, slug
+from .tools import CACHE_DIR, OUTPUT_DIR, check_stop, fmt_ts, parse_ts, probe, slug
 from .transcribe import file_key, transcribe_auto
 
 SFX_NAMES = {
@@ -253,6 +253,13 @@ def process(source, cfg, log=print, live=None):
     chat_signals, chat_note, taken [(s, e) already clipped, in this file's seconds],
     reviewed (seconds at the start already checked last time), more_coming (bool)."""
     cfg = {**DEFAULTS, **(cfg or {})}
+    if cfg["layout"] == "split":
+        cfg["split_on"] = True
+    if cfg["layout"] == "facecam" and not cfg["split_on"]:
+        fc = cfg.get("facecam") or {}
+        if not (fc.get("cam") and fc.get("game")):     # checked before any download / transcription
+            raise ValueError("The facecam layout needs both boxes: load a frame and draw the "
+                             "facecam and gameplay boxes first.")
     if live:
         cfg["top_n_on"] = False
         cfg["n_clips"] = max(1, int(live.get("max_clips") or 2))
@@ -268,6 +275,7 @@ def process(source, cfg, log=print, live=None):
 
     r0, r1 = _source_range(cfg, total, log)
     media = _listen(source, info, cfg, r0, r1, log, live)
+    check_stop()
     words, signals = media["words"], media["signals"]
     usage = {"models": set(), "cost": media["cost"]}     # every AI model used + total est. cost
     if media["engine"].startswith("cloud:"):
@@ -340,6 +348,7 @@ def process(source, cfg, log=print, live=None):
 
     def render(tl, name):
         """Render one timeline into out_dir; returns (file, name of the gameplay video under it)."""
+        check_stop()
         out = os.path.join(out_dir, name + ".mp4")
         gp = picker.pick(tl.length) if picker else None
         render_timeline(source, tl.segments, tl.events, tl.sfx, out, vf, info["has_audio"],
@@ -522,6 +531,7 @@ def _ask_for_clips(segments, signals, cfg, r0, r1, n_clips, min_len, max_len, no
                     f"(e.g. \"Watch {creator}...\"), always in spotlight hooks.") if creator else ""
     candidates = []
     for w0, w1 in wins:
+        check_stop()
         k = max(2, math.ceil(n_clips * (w1 - w0) / (r1 - r0)) + 1)
         text = annotate(segments, signals, w0, w1)
         if len(text) < 200:
@@ -631,16 +641,16 @@ def _select(candidates, words, r0, r1, min_len, max_len, limit, live):
 
 def _layout(cfg, info, split, log):
     """Frame layout. Returns (filter template, (caption_y, hook_y), logo or None).
-    A sponsor logo must sit on the blurred band, never on the gameplay, so with a logo the crop
-    layout becomes blur (split-screen puts it on the gameplay half)."""
+    A sponsor logo must never cover the content, so with a logo the crop layout becomes blur
+    (the logo sits on the blurred band); split-screen and facecam put it on the gameplay."""
     with_logo = has_logo(cfg)
     layout = "split" if split else cfg["layout"]
-    if with_logo and not split:
-        if cfg["layout"] == "crop":
-            log("Logo is set: using the blur layout so the logo sits on the blurred band, not the gameplay.")
+    if with_logo and layout == "crop":
+        log("Logo is set: using the blur layout so the logo sits on the blurred band, not the gameplay.")
         layout = "blur"
     vf, cap_y, hook_y, logo_y = layout_geometry(layout, info["width"], info["height"],
-                                                float(cfg["zoom"]), logo=with_logo)
+                                                float(cfg["zoom"]), logo=with_logo,
+                                                boxes=cfg.get("facecam"))
     logo = None
     if with_logo:
         png, _, lh = fitted_logo(cfg["logo_path"], float(cfg.get("logo_size") or 1.0))

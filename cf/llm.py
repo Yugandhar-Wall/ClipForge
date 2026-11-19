@@ -20,6 +20,8 @@ import time
 
 import requests
 
+from .tools import stoppable
+
 API = "https://openrouter.ai/api/v1"
 _SKIP = re.compile(r"embed|guard|rerank|moderat|tts|whisper|audio|image|vision-only|lyria|search", re.I)
 _SIZE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)b\b", re.I)
@@ -148,8 +150,8 @@ def chat_json(key, messages, in_tokens, out_tokens=3000, model="auto", allow_fre
         label = "free" if cost == 0 else (f"~${cost:.4f}" if cost is not None else "")
         log(f"Asking {mid} {label}...")
         try:
-            r = requests.post(f"{API}/chat/completions", headers=headers(key),
-                              json=body, timeout=300)
+            r = stoppable(requests.post, f"{API}/chat/completions", headers=headers(key),
+                          json=body, timeout=300)
         except requests.RequestException as e:
             errors.append(f"{mid}: {e}")
             continue

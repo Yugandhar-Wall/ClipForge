@@ -12,6 +12,8 @@ What a session does, start to finish
 6. Checked pieces are deleted (only the overlap is kept), so disk use stays at a few minutes
    of video however long the stream runs. "Keep the full recording" moves them to the output
    folder instead.
+7. When the stream ends, what was recorded since the last check is checked once more. Stop
+   ends the session at once instead: a check in progress is abandoned (see tools.stop_scope).
 """
 import atexit
 import os
@@ -26,8 +28,9 @@ from collections import deque
 from . import chat as CH
 from . import publish as PUB
 from .pipeline import process
-from .tools import (CACHE_DIR, NO_WINDOW, OUTPUT_DIR, ffmpeg_exe, fmt_ts, hls_input_opts, is_hls,
-                    js_runtimes, node_exe, probe, run_ffmpeg, slug, strip_ansi)
+from .tools import (CACHE_DIR, NO_WINDOW, OUTPUT_DIR, Cancelled, check_stop, ffmpeg_exe, fmt_ts,
+                    hls_input_opts, is_hls, js_runtimes, node_exe, probe, run_ffmpeg, slug,
+                    stop_scope, stoppable, strip_ansi)
 from .transcribe import file_key
 
 LIVE_DIR = os.path.join(CACHE_DIR, "live")
@@ -125,7 +128,8 @@ class LiveSession:
         self._feeder = None                    # yt-dlp process feeding the recorder (pipe mode)
         self._modes = ["pipe", "direct"]       # pipe: yt-dlp downloads, ffmpeg only cuts pieces
         self._rec_done = threading.Event()
-        self._stop = threading.Event()
+        self._stop = threading.Event()         # shut the session down (Stop, stream over, disk full)
+        self._user_stop = threading.Event()    # Stop was pressed: abandon everything at once
         self._rec_error = ""
         self.chatbuf = None
         self._chat = None
@@ -139,8 +143,11 @@ class LiveSession:
         return self
 
     def stop(self):
-        if not self._stop.is_set():
-            self.log("Stopping: finishing the last check...")
+        """Stop now: the recorder and chat reader are shut down and a check that is running is
+        abandoned. Footage that wasn't checked yet is discarded."""
+        if not self._user_stop.is_set():
+            self.log("Stopping...")
+        self._user_stop.set()
         self._stop.set()
 
     def join(self, timeout=None):
@@ -184,6 +191,10 @@ class LiveSession:
 
     # ------------------------------------------------------------ main loop
     def _run(self):
+        with stop_scope(self._user_stop):
+            self._session()
+
+    def _session(self):
         try:
             info = self._wait_live()
             if info is None:
@@ -211,8 +222,15 @@ class LiveSession:
             rec.join(30)
             if self._rec_error:
                 self.log(self._rec_error)
+            check_stop()
+            # the stream ended (or the disk is nearly full): check what was recorded since the last check
             while self._checkpoint(final=True):
                 pass
+        except Cancelled:
+            self.state = "stopping"
+            left = sum(sg["dur"] for i, sg in self._segs.items() if i > self._done_idx)
+            self.log("Stopped." + (f" The last {fmt_ts(left)} of the recording weren't checked."
+                                   if left >= 5 else ""))
         except Exception as e:
             self.error = str(e)
             self.log(f"ERROR: {e}")
@@ -239,7 +257,7 @@ class LiveSession:
         while not self._stop.is_set():
             why = ""
             try:
-                info = self._resolve(self.url)
+                info = stoppable(self._resolve, self.url)
             except NotLiveYet as e:
                 info, why = None, str(e)
             if info and info["live"]:
@@ -745,6 +763,14 @@ def start(url, cfg):
 def stop():
     if _current:
         _current.stop()
+
+
+def forget():
+    """Drop a finished session so the page starts clean (a running one is kept)."""
+    global _current
+    with _guard:
+        if _current and not _current.running:
+            _current = None
 
 
 @atexit.register

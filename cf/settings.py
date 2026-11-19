@@ -24,6 +24,7 @@ DEFAULTS = {
     "meme_on": False, "meme_gain": 0.8, "range_start": "", "range_end": "",
     "live_interval": 5, "live_min_score": 70, "live_max_clips": 2, "live_upload": True,
     "live_keep": False, "live_chat_on": True,
+    "keep_days": 6,
 }
 
 

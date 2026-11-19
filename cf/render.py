@@ -36,12 +36,61 @@ class Segment:
         return (self.src_e - self.src_s) / self.speed + self.freeze
 
 
-def layout_geometry(layout, src_w, src_h, zoom=1.25, logo=False):
+FACECAM_SPLIT = (0.25, 0.55)   # allowed share of the frame height for the facecam
+
+
+def facecam_heights(split):
+    """(facecam height, gameplay height) in the 1080x1920 frame for a facecam share `split`."""
+    share = min(FACECAM_SPLIT[1], max(FACECAM_SPLIT[0], float(split or 0.4)))
+    top = int(round(H * share / 2)) * 2
+    return top, H - top
+
+
+def fit_box(box, src_w, src_h, aspect):
+    """A normalised box [x, y, w, h] (0-1 of the source frame) -> pixel crop (x, y, w, h) with
+    exactly `aspect` (width / height), centred where the box was and kept inside the frame.
+    The box picker already locks the aspect; this guarantees it (no stretched faces)."""
+    x, y, w, h = (float(v) for v in box)
+    cx, cy = (x + w / 2) * src_w, (y + h / 2) * src_h
+    bw, bh = max(16.0, w * src_w), max(16.0, h * src_h)
+    if bw / bh > aspect:
+        bw = bh * aspect
+    else:
+        bh = bw / aspect
+    scale = min(1.0, src_w / bw, src_h / bh)          # never larger than the frame
+    bw, bh = bw * scale, bh * scale
+    bw, bh = max(16, int(bw // 2) * 2), max(16, int(bh // 2) * 2)
+    px = int(min(max(0, cx - bw / 2), src_w - bw)) // 2 * 2
+    py = int(min(max(0, cy - bh / 2), src_h - bh)) // 2 * 2
+    return px, py, bw, bh
+
+
+def layout_geometry(layout, src_w, src_h, zoom=1.25, logo=False, boxes=None):
     """Returns (filter template using {inp}, caption_y, hook_y, logo_y).
     logo_y is None without a logo. With a logo the blurred layout is always used (the logo
     must sit on the blurred band, never on the gameplay): captions move up against the
-    gameplay and the logo goes directly under them."""
+    gameplay and the logo goes directly under them.
+
+    "facecam": two boxes the user drew on a frame (boxes = {"cam", "game": [x, y, w, h] 0-1,
+    "split": facecam share of the height}). The facecam fills the top, the gameplay the bottom,
+    captions sit on the line between them. Hook, labels, stickers and a logo go on the gameplay
+    under the captions, so nothing ever covers the streamer's face.
+    Its template also has a {zoom} slot: punch-in zooms act on the gameplay only."""
     aspect = (src_w / src_h) if src_w and src_h else 16 / 9
+    if layout == "facecam":
+        src_w, src_h = src_w or 1920, src_h or 1080
+        if not boxes or not boxes.get("cam") or not boxes.get("game"):
+            raise ValueError("The facecam layout needs both boxes: load a frame and draw the "
+                             "facecam and gameplay boxes first.")
+        top, bot = facecam_heights(boxes.get("split"))
+        cx, cy, cw, ch = fit_box(boxes["cam"], src_w, src_h, W / top)
+        gx, gy, gw, gh = fit_box(boxes["game"], src_w, src_h, W / bot)
+        vf = (f"{{inp}}split[fca][fcb];"
+              f"[fca]crop={cw}:{ch}:{cx}:{cy},scale={W}:{top}:flags=lanczos,setsar=1[fcam];"
+              f"[fcb]crop={gw}:{gh}:{gx}:{gy}{{zoom}},scale={W}:{bot}:flags=lanczos,setsar=1[fgame];"
+              f"[fcam][fgame]vstack=inputs=2,setsar=1[base]")
+        hook_y = min(top + (480 if logo else 330), H - 560)   # stickers sit 340 px lower
+        return vf, top, hook_y, (top + 105 if logo else None)
     if layout == "split":
         # content fills the top half; the gameplay video is stacked under it at render time.
         # Captions sit on the seam, the hook over the content, a logo on the gameplay half.
@@ -141,12 +190,16 @@ def _render_segment(src, seg, off, total, events, sfx, out, layout_vf, has_audio
         args += ["-stream_loop", "-1", "-ss", f"{gp_t:.3f}", "-t", f"{dur + 0.5:.3f}",
                  "-i", os.path.abspath(gameplay["path"])]
 
+    # a layout with a {zoom} slot (facecam) zooms inside its own graph: on the gameplay only
+    own_zoom = "{zoom}" in layout_vf
+    zoom_in = (f",crop=trunc(iw/{seg.zoom:.4f}/2)*2:trunc(ih/{seg.zoom:.4f}/2)*2"
+               if own_zoom and seg.zoom > 1.001 else "")
     v = [f"[0:v]setpts=(PTS-STARTPTS)/{seg.speed},fps=30[src]",
-         layout_vf.format(inp="[src]")]
+         layout_vf.format(inp="[src]", zoom=zoom_in)]
     chain = "[base]"
     post = []
     ph = SPLIT_H if gameplay else H   # zoom / grey / freeze act on the content only
-    if seg.zoom > 1.001:
+    if seg.zoom > 1.001 and not own_zoom:
         zw, zh = int(W * seg.zoom / 2) * 2, int(ph * seg.zoom / 2) * 2
         post.append(f"scale={zw}:{zh},crop={W}:{ph}")
     if seg.gray:
@@ -226,24 +279,26 @@ def render_timeline(src, segments, events, sfx, out_path, layout_vf, has_audio=T
     workdir = workdir or os.path.dirname(out_path)
     tmp = os.path.join(workdir, "_parts_" + os.path.splitext(os.path.basename(out_path))[0])
     os.makedirs(tmp, exist_ok=True)
-    if not os.path.isdir(os.path.join(tmp, "fonts")):
-        shutil.copytree(FONTS_DIR, os.path.join(tmp, "fonts"))
     total = sum(s.dur for s in segments)
-    parts, off = [], 0.0
-    for i, seg in enumerate(segments):
-        part = os.path.join(tmp, f"part{i:02d}.mp4")
-        _render_segment(src, seg, off, total, events, sfx, part, layout_vf, has_audio,
-                        sfx_gain, progress_bar, tmp, i, logo, overlays, memes, meme_gain,
-                        gameplay)
-        parts.append(part)
-        off += seg.dur
-    with open(os.path.join(tmp, "list.txt"), "w", encoding="utf-8") as f:
-        for p in parts:
-            f.write(f"file '{os.path.basename(p)}'\n")
-    # join; loudness-normalise the whole short in one pass (-14 LUFS, social standard)
-    run_ffmpeg(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c:v", "copy",
-                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100",
-                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
-                os.path.abspath(out_path)], cwd=tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        if not os.path.isdir(os.path.join(tmp, "fonts")):
+            shutil.copytree(FONTS_DIR, os.path.join(tmp, "fonts"))
+        parts, off = [], 0.0
+        for i, seg in enumerate(segments):
+            part = os.path.join(tmp, f"part{i:02d}.mp4")
+            _render_segment(src, seg, off, total, events, sfx, part, layout_vf, has_audio,
+                            sfx_gain, progress_bar, tmp, i, logo, overlays, memes, meme_gain,
+                            gameplay)
+            parts.append(part)
+            off += seg.dur
+        with open(os.path.join(tmp, "list.txt"), "w", encoding="utf-8") as f:
+            for p in parts:
+                f.write(f"file '{os.path.basename(p)}'\n")
+        # join; loudness-normalise the whole short in one pass (-14 LUFS, social standard)
+        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c:v", "copy",
+                    "-af", "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100",
+                    "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+                    os.path.abspath(out_path)], cwd=tmp)
+    finally:                      # also after Stop or an error: no half-rendered pieces left behind
+        shutil.rmtree(tmp, ignore_errors=True)
     return out_path, total

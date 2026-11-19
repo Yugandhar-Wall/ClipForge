@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 
-from .tools import CACHE_DIR, MOTION_DIR, MOTION_READY, NO_WINDOW, ffmpeg_exe, node_exe, read_json
+from .tools import CACHE_DIR, MOTION_DIR, MOTION_READY, Cancelled, ffmpeg_exe, node_exe, read_json, run_cmd
 
 TPL_DIR = os.path.join(MOTION_DIR, "templates")
 ASSET_DIR = os.path.join(CACHE_DIR, "motion")
@@ -111,22 +111,8 @@ def _have(key):
     return os.path.exists(os.path.join(asset_dir(key), ".done"))
 
 
-def _prune(max_age_days=45):
-    """Forget animations not used for a while (each is a few MB)."""
-    now = time.time()
-    for d in glob.glob(os.path.join(ASSET_DIR, "*")):
-        try:
-            if now - os.path.getmtime(os.path.join(d, ".done")) > max_age_days * 86400:
-                shutil.rmtree(d, ignore_errors=True)
-            elif os.path.basename(d).startswith("hf_") and now - os.path.getmtime(d) > 86400:
-                shutil.rmtree(d, ignore_errors=True)  # leftovers of an interrupted render
-        except OSError:
-            pass
-
-
 def render_assets(reqs, log=print):
     """Render every request whose asset isn't cached. Returns the set of keys available."""
-    _prune()
     for r in reqs:  # mark cached ones as used
         try:
             os.utime(os.path.join(asset_dir(r["key"]), ".done"))
@@ -159,12 +145,13 @@ def _render_batch(kind, rows, log):
            "--fps", str(FPS), "--batch", batch, "--batch-concurrency", "2",
            "-o", os.path.join(work, "r_{index}"), "--json"]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           env=_env(), cwd=MOTION_DIR, timeout=120 + 40 * len(keys),
-                           creationflags=NO_WINDOW)
+        p = run_cmd(cmd, env=_env(), cwd=MOTION_DIR, timeout=120 + 40 * len(keys))
         out = p.stdout.strip()
         if p.returncode != 0 and not out:
             raise RuntimeError((p.stderr or "")[-400:].strip() or f"exit code {p.returncode}")
+    except Cancelled:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
     except Exception as e:
         log(f"  motion '{kind}' failed: {e}")
         shutil.rmtree(work, ignore_errors=True)

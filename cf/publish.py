@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from .tools import ROOT, read_json
+from .tools import ROOT, check_stop, read_json
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -340,6 +340,7 @@ def upload_queue(cfg, log=print):
         + (f", going public every {gap} min from {_local(_when(slot))}." if mode == "scheduled" else
            ". They stay private until you publish them."))
     for n, item in enumerate(todo, 1):
+        check_stop()          # Stop: the rest stay queued
         if not os.path.exists(item["file"]):
             item.update(status="failed", error="file no longer exists")
             failed += 1

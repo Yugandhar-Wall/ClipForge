@@ -5,7 +5,7 @@ import os
 
 from .audio import STT_PROMPT, read_speech
 from .cloud_stt import MODELS as CLOUD_MODELS, CloudSTTError, transcribe_cloud
-from .tools import CACHE_DIR, read_json, write_json
+from .tools import CACHE_DIR, check_stop, read_json, write_json
 
 _MODELS = {}
 LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
@@ -61,6 +61,7 @@ def transcribe(wav, model_size="small", language=None, log=print, cache_key=None
     out = {"language": info.language, "segments": []}
     last_report = 0
     for seg in segments:
+        check_stop()
         words = [{"w": w.word.strip(), "s": round(w.start, 2), "e": round(w.end, 2)}
                  for w in (seg.words or []) if w.word.strip()]
         out["segments"].append({"s": round(seg.start, 2), "e": round(seg.end, 2),
