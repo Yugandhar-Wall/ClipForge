@@ -90,7 +90,7 @@ For each clip write:
 Sound effect names: {sfx}
 {creator_note}{notes}
 Use a mix of formats across the clips - not all the same.
-Language: write title, hook, tease, cta, label and caption in the language the audience speaks (the transcript's language). For Hindi/Urdu transcripts use Hinglish (Hindi written in English letters, e.g. "Bhai ne kya kar diya 😭") - never Devanagari for on-screen text.
+{language}
 
 JSON format:
 {{"clips":[{{"start":12.3,"end":45.6,"payoff":38.2,"format":"cold_open","title":"...","hook":"...","tease":"...","cta":"...","label":"...","caption":"...","scores":{{"hook":22,"emotion":21,"payoff":17,"context":13,"share":12}},"trigger":"...","reason":"...","keywords":["..."],"sfx":[{{"t":20.1,"name":"impact"}}]}}]}}
@@ -238,6 +238,40 @@ def _assign_formats(chosen, allowed):
         c["format"] = want
 
 
+# ---------------------------------------------------------------- output language
+LANG_NAMES = {"en": "English", "es": "Spanish", "pt": "Portuguese", "fr": "French", "de": "German",
+              "it": "Italian", "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "id": "Indonesian",
+              "tl": "Filipino", "ru": "Russian", "ja": "Japanese", "ko": "Korean", "ar": "Arabic",
+              "zh": "Chinese"}
+LATIN = {"en", "es", "pt", "fr", "de", "it", "nl", "pl", "tr", "id", "tl", "hi", "ur"}   # hi/ur: Hinglish
+_DEVANAGARI = re.compile("[\u0900-\u097F]")
+_NON_LATIN = re.compile("[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF"
+                        "\u3400-\u9FFF\uAC00-\uD7AF]")
+
+
+def _output_language(cfg, transcript_language, words):
+    """The language the AI must write titles, hooks and captions in: the one set in Settings,
+    else the transcript's (else guessed from the script of the words). Returns
+    (code, instruction for the prompt). Hindi/Urdu streams get Hinglish (Latin letters)."""
+    code = str(cfg.get("language") or transcript_language or "").strip().lower()[:2]
+    if not code:
+        dev = sum(1 for w in words if _DEVANAGARI.search(w["w"]))
+        code = "hi" if words and dev > 0.3 * len(words) else "en"
+    if code in ("hi", "ur"):
+        return code, ('LANGUAGE: the streamer speaks Hindi/Urdu. Write title, hook, tease, cta, label, caption '
+                      'and keywords in Hinglish (Hindi written in English letters, e.g. "Bhai ne kya kar diya"). '
+                      'Never use Devanagari or Urdu script.')
+    name = LANG_NAMES.get(code, f"the transcript's language ({code})")
+    return code, (f"LANGUAGE: the video is in {name}. Write title, hook, tease, cta, label, caption and "
+                  f"keywords in {name} only - no other language or script.")
+
+
+def _wrong_script(text, code):
+    """True when text meant to be in a Latin-script language (or Hinglish) contains another script,
+    e.g. an English video's title written in Hindi."""
+    return code in LATIN and bool(_NON_LATIN.search(text or ""))
+
+
 def _clean_keywords(raw, cap=50):
     """Model keywords -> unique, lowercase, non-empty strings (accepts a list or a comma string)."""
     if isinstance(raw, str):
@@ -310,6 +344,7 @@ def process(source, cfg, log=print, live=None):
     r0, r1 = _source_range(cfg, total, log)
     media = _listen(source, info, cfg, r0, r1, log, live)
     check_stop()
+    cfg["_lang"] = _output_language(cfg, media["language"], media["words"])   # (code, prompt line)
     words, signals = media["words"], media["signals"]
     usage = {"models": set(), "cost": media["cost"]}     # every AI model used + total est. cost
     if media["engine"].startswith("cloud:"):
@@ -507,6 +542,7 @@ def _listen(source, info, cfg, r0, r1, log, live):
     log(f"{len(words)} words transcribed. Reaction signals: "
         + (", ".join(f"{v} {k}" for k, v in kinds.items()) or "none"))
     return {"segments": segments, "words": words, "loud": loud, "signals": signals,
+            "language": tr.get("language") or "",
             "engine": tr.get("engine", ""), "cost": float(tr.get("cost") or 0)}
 
 
@@ -580,11 +616,13 @@ def _ask_for_clips(segments, signals, cfg, r0, r1, n_clips, min_len, max_len, no
             task = _live_task(live, k)
         prompt = USER_TMPL.format(hint=cfg["content_hint"] or "gaming video", w0=w0, w1=w1, task=task,
                                   min_len=min_len, max_len=max_len, sfx=sfx_desc, formats=fmts,
-                                  creator_note=creator_note, notes=notes, hot=hot, transcript=text)
+                                  creator_note=creator_note, notes=notes, language=cfg["_lang"][1],
+                                  hot=hot, transcript=text)
         data, model, cost = chat_json(cfg["api_key"], [
             {"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
             est_tokens(prompt) + 400, out_tokens=min(8000, 600 * k + 500), model=cfg["model"],
-            allow_free=cfg["allow_free"], validate=_validator(w0, w1, min_len, max_len, live), log=log)
+            allow_free=cfg["allow_free"], validate=_validator(w0, w1, min_len, max_len, live, cfg["_lang"][0]),
+            log=log)
         usage["models"].add(model)
         usage["cost"] += cost or 0
         log(f"  {model} suggested {len(data['clips'])} clips.")
@@ -604,16 +642,16 @@ def _live_task(live, k):
                             seen=seen + ("\n" if seen else ""), chat=live.get("chat_note") or "")
 
 
-def _validator(w0, w1, min_len, max_len, live):
-    """Quality gate for the AI's answer: tidies usable clips, and rejects lazy/broken answers so
-    the next model is tried."""
+def _validator(w0, w1, min_len, max_len, live, lang="en"):
+    """Quality gate for the AI's answer: tidies usable clips, and rejects lazy/broken answers -
+    including text in the wrong language or script - so the next model is tried."""
     def validate(d):
         clips = d.get("clips") if isinstance(d, dict) else None
         if live and isinstance(clips, list) and not clips:
             return          # "nothing viral here" is a valid live answer
         if not clips or not isinstance(clips, list):
             raise ValueError("no clips list")
-        ok = []
+        ok, wrong_lang = [], 0
         for c in clips:
             if not isinstance(c, dict):
                 continue
@@ -627,7 +665,11 @@ def _validator(w0, w1, min_len, max_len, live):
             for key in ("sfx", "stickers", "memes"):
                 if not isinstance(c.get(key), list):
                     c[key] = []
-            c["keywords"] = _clean_keywords(c.get("keywords"))
+            c["keywords"] = [k for k in _clean_keywords(c.get("keywords")) if not _wrong_script(k, lang)]
+            if _wrong_script(" ".join(str(c.get(k) or "") for k in ("title", "hook", "caption", "tease",
+                                                                     "cta", "label")), lang):
+                wrong_lang += 1
+                continue
             try:
                 c["start"], c["end"] = float(c["start"]), float(c["end"])
             except (KeyError, TypeError, ValueError):
@@ -642,6 +684,8 @@ def _validator(w0, w1, min_len, max_len, live):
             if "#" not in str(c.get("caption", "")):
                 continue
             ok.append(c)
+        if wrong_lang and not ok:
+            raise ValueError("titles/captions in the wrong language")
         need = 0 if live else (1 if (w1 - w0) < 5 * max_len else 2)
         if len(ok) < need:
             raise ValueError(f"only {len(ok)} usable clips (need {need})")
@@ -753,14 +797,15 @@ def _top_n_package(best, cfg, log, models_used, rules=None):
               f". I made a countdown Short of the top {n} moments:\n{items}\n"
               f"Write: 'title' (viral but honest, max 70 chars), 'hook' (on-screen opener, max 6 words, "
               f"e.g. 'TOP 5 CRAZIEST GTA 6 MOMENTS'), 'cta' (end question for comments, max 8 words), "
-              f"'caption' (1-2 sentences + 4-6 hashtags). Reply JSON with those 4 keys.")
+              f"'caption' (1-2 sentences + 4-6 hashtags). Reply JSON with those 4 keys.\n"
+              + _lang_line(cfg))
     if rules:
         prompt += "\nAll text must follow these campaign rules:\n" + R.prompt_block(rules)
     try:
         data, model, _ = chat_json(cfg["api_key"], [{"role": "user", "content": prompt}],
                                    500 + (len(rules["text"]) // 3 if rules else 0), 600,
                                    cfg["model"], cfg["allow_free"], log=log,
-                                   validate=lambda d: d.get("title") or (_ for _ in ()).throw(ValueError("no title")))
+                                   validate=_pack_validator(cfg))
         models_used.add(model)
         pack = {k: str(data.get(k) or default[k]) for k in default}
     except Exception as e:
@@ -778,6 +823,20 @@ def _top_n_package(best, cfg, log, models_used, rules=None):
     return pack
 
 
+def _lang_line(cfg):
+    return (cfg.get("_lang") or (None, ""))[1]
+
+
+def _pack_validator(cfg):
+    def validate(d):
+        if not isinstance(d, dict) or not d.get("title"):
+            raise ValueError("no title")
+        if _wrong_script(" ".join(str(d.get(k) or "") for k in ("title", "hook", "cta", "caption")),
+                         (cfg.get("_lang") or ("en",))[0]):
+            raise ValueError("wrote in the wrong language")
+    return validate
+
+
 def _settle_sfx(tl, sfx_on):
     """Meme sounds win: drop regular effects within 1.2 s of one (they'd clash); with sound
     effects off, only the meme sounds stay."""
@@ -792,7 +851,8 @@ def _write_titles_without_transcript(chosen, cfg, log, models_used):
               f"(max 70 chars), 'hook' (max 6 words) and 'caption' (1 sentence + 4-6 hashtags). "
               f"Keep them generic enough to be true without seeing the clip. "
               f'Reply JSON: {{"clips":[{{"id":1,"title":"...","hook":"...","caption":"..."}}]}}\n'
-              f"Clip ids: {list(range(1, len(chosen) + 1))}")
+              f"Clip ids: {list(range(1, len(chosen) + 1))}\n" + _lang_line(cfg))
+    lang = (cfg.get("_lang") or ("en",))[0]
     try:
         data, model, _ = chat_json(cfg["api_key"], [{"role": "user", "content": prompt}], 600,
                                    1500, cfg["model"], cfg["allow_free"], log=log)
@@ -800,6 +860,7 @@ def _write_titles_without_transcript(chosen, cfg, log, models_used):
         by_id = {int(c.get("id", 0)): c for c in data.get("clips", []) if isinstance(c, dict)}
         for i, c in enumerate(chosen, start=1):
             for k in ("title", "hook", "caption"):
-                c[k] = (by_id.get(i) or {}).get(k, "") or c.get(k, "")
+                v = str((by_id.get(i) or {}).get(k, "") or "")
+                c[k] = v if v and not _wrong_script(v, lang) else c.get(k, "")
     except Exception as e:
         log(f"Could not generate titles ({e}); clips will be rendered without them.")
