@@ -1,0 +1,13 @@
+# When each meme sound fits. One line per file:   file name: when to use it
+# Drop new sounds (mp3/wav/m4a/ogg) in this folder; add a line here so the AI knows the joke.
+# A file without a line still works: the AI goes by its name (use the meme's real name).
+fahhh.mp3: long distorted "FAAAH" yell. Near misses and almost-disasters: something flies just past someone, a car/shot/jump JUST misses, a narrow escape, or a fail you could see coming. Hit = the instant it misses.
+vine-boom.mp3: deep Vine "boom". Punctuates a shocking or awkward line, a sudden realisation, a dramatic stare, "did he really just say that". Hit = right after the line.
+anime-wow.mp3: high anime "wowww" chorus (4 s). Something impressive or a smooth flex, an unexpected skill, a surprising reveal, or ironic praise for something dumb.
+among-us-role-reveal.mp3: Among Us role-reveal sting, tense synth then a big low hit. Someone exposed or caught, a betrayal, "it was HIM", a sus moment, a plot twist. Hit = the reveal.
+dun-dun-duuuun.mp3: dramatic "dun dun DUUUN" sting (4 s). Ominous turn, things about to go very wrong, a dramatic overreaction played for comedy.
+sad-violin-the-meme-one.mp3: tiny sad violin (4.5 s). Mock sympathy after a loss, a fail, a rejection or someone getting roasted.
+wrong-answer.mp3: game-show wrong-answer buzzer. Wrong guess, terrible decision, failed attempt, a lie getting called out.
+few-moments.mp3: narrator voice "a few moments later" (SpongeBob title card). Ironic: right after someone makes a confident claim, just before it falls apart, or at a jump in time.
+dry-fart.mp3: short fart. Awkward silence, cringe, an embarrassing fail, someone getting caught off guard.
+pop-sound-effect.mp3: small pop. Light emphasis on a word or a quick realisation; also fine for something appearing.

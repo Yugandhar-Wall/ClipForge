@@ -1,0 +1,6 @@
+@font-face { font-family: "MX"; src: url("Montserrat-ExtraBold.ttf"); }
+html, body { margin: 0; padding: 0; background: transparent; }
+#root { position: relative; width: 1080px; height: 1920px; overflow: hidden;
+  font-family: "MX", "Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", sans-serif; }
+.emoji { font-family: "Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", sans-serif; }
+.center { position: absolute; left: 0; width: 1080px; display: flex; justify-content: center; }

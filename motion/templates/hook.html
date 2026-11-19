@@ -1,0 +1,56 @@
+<!doctype html>
+<html data-composition-variables='[
+ {"id":"text","type":"string","label":"Text","default":"YOU WON&apos;T BELIEVE WHAT HAPPENS NEXT"},
+ {"id":"y","type":"number","label":"Centre Y","default":420},
+ {"id":"style","type":"string","label":"box | slam","default":"box"}
+]'>
+<head><meta charset="utf-8"><link rel="stylesheet" href="common.css">
+<style>
+.box { position: relative; max-width: 940px; padding: 22px 34px 26px; background: #fff; border-radius: 26px;
+  text-align: center; color: #111; text-transform: uppercase; line-height: 1.08;
+  box-shadow: 0 14px 0 rgba(0,0,0,.35); overflow: hidden; }
+.box .w { display: inline-block; }
+.box .w.hi { color: #E8262C; }
+.box .shine { position: absolute; top: -20%; left: 0; width: 120px; height: 140%;
+  background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,.85), rgba(255,255,255,0));
+  transform: rotate(18deg); opacity: 0; }
+.slam { max-width: 960px; text-align: center; color: #FFD400; text-transform: uppercase; line-height: 1.05;
+  -webkit-text-stroke: 12px #000; paint-order: stroke fill; filter: drop-shadow(0 10px 0 rgba(0,0,0,.6)); }
+.slam .w { display: inline-block; }
+.slam .w.hi { color: #fff; }
+</style>
+<script src="common.js"></script><script src="gsap.min.js"></script></head>
+<body>
+<div id="root" data-composition-id="root" data-width="1080" data-height="1920" data-start="0" data-duration="1.5">
+  <div class="center" id="wrap"><div id="card"></div></div>
+</div>
+<script>
+const V = CF.vars(), text = String(V.text || "").trim();
+const wrap = document.getElementById("wrap"), card = document.getElementById("card");
+const slam = V.style === "slam";
+card.className = slam ? "slam" : "box";
+card.style.fontSize = CF.fit(text, slam ? [[14,112],[26,96],[40,82],[999,70]] : [[16,92],[28,80],[40,70],[999,60]]) + "px";
+const spans = CF.words(card, text, CF.keyword(text));
+let shine = null;
+if (!slam) { shine = document.createElement("div"); shine.className = "shine"; card.appendChild(shine); }
+wrap.style.top = (V.y - card.offsetHeight / 2) + "px";
+const tl = gsap.timeline({ paused: true });
+if (slam) {
+  tl.set(spans, { opacity: 0, scale: 2.6, rotation: -8 }, 0);
+  spans.forEach((s, i) => tl.to(s, { opacity: 1, scale: 1, rotation: 0, duration: 0.2, ease: "power4.out" }, 0.04 + i * 0.1));
+  const end = 0.04 + spans.length * 0.1 + 0.1;
+  tl.to(card, { x: -10, duration: 0.04, yoyo: true, repeat: 5, ease: "none" }, end);
+  tl.to(card, { x: 0, duration: 0.04 }, end + 0.24);
+} else {
+  tl.fromTo(card, { scaleX: 0.05, scaleY: 0.6, opacity: 0 }, { scaleX: 1, scaleY: 1, opacity: 1, duration: 0.28, ease: "back.out(2)" }, 0);
+  tl.set(spans, { opacity: 0, y: 34 }, 0);
+  spans.forEach((s, i) => tl.to(s, { opacity: 1, y: 0, duration: 0.2, ease: "back.out(3)" }, 0.16 + i * 0.07));
+  const hi = card.querySelector(".hi");
+  const t = Math.min(0.95, 0.2 + spans.length * 0.07);
+  if (hi) tl.fromTo(hi, { scale: 1 }, { scale: 1.18, duration: 0.12, yoyo: true, repeat: 1, ease: "power2.out" }, t);
+  tl.fromTo(shine, { x: -200, opacity: 1 }, { x: card.offsetWidth + 100, opacity: 1, duration: 0.4, ease: "power1.inOut" }, t + 0.1);
+  tl.set(shine, { opacity: 0 }, t + 0.52);
+}
+CF.done(tl, 1.5);
+</script>
+</body></html>

@@ -1,0 +1,36 @@
+<!doctype html>
+<html data-composition-variables='[
+ {"id":"emoji","type":"string","label":"Emoji","default":"😱"},
+ {"id":"text","type":"string","label":"Text","default":"NO WAY"},
+ {"id":"x","type":"number","label":"Centre X","default":800},
+ {"id":"y","type":"number","label":"Centre Y","default":720},
+ {"id":"tilt","type":"number","label":"Tilt (+1 / -1)","default":1}
+]'>
+<head><meta charset="utf-8"><link rel="stylesheet" href="common.css">
+<style>
+.st { position: absolute; width: 420px; text-align: center; }
+.e { font-size: 200px; line-height: 1.05; filter: drop-shadow(0 10px 0 rgba(0,0,0,.45)); }
+.t { display: inline-block; margin-top: -18px; padding: 8px 24px 12px; background: #FFD400; color: #111;
+  font-size: 54px; border-radius: 16px; border: 6px solid #111; text-transform: uppercase; white-space: nowrap; }
+</style>
+<script src="common.js"></script><script src="gsap.min.js"></script></head>
+<body>
+<div id="root" data-composition-id="root" data-width="1080" data-height="1920" data-start="0" data-duration="1.5">
+  <div class="st" id="st"><div class="e emoji" id="e"></div><div class="t" id="t"></div></div>
+</div>
+<script>
+const V = CF.vars(), st = document.getElementById("st"), tag = document.getElementById("t");
+document.getElementById("e").textContent = String(V.emoji || "😱");
+const text = String(V.text || "").trim();
+tag.textContent = text; if (!text) tag.style.display = "none";
+st.style.left = (V.x - 210) + "px"; st.style.top = (V.y - st.offsetHeight / 2) + "px";
+const k = V.tilt < 0 ? -1 : 1;
+const tl = gsap.timeline({ paused: true });
+tl.fromTo(st, { scale: 0, rotation: -40 * k }, { scale: 1, rotation: 10 * k, duration: 0.3, ease: "back.out(3)" }, 0);
+tl.fromTo(tag, { scale: 0 }, { scale: 1, duration: 0.2, ease: "back.out(4)" }, 0.16);
+tl.to(st, { rotation: -6 * k, duration: 0.16, yoyo: true, repeat: 3, ease: "sine.inOut" }, 0.3);
+tl.to(st, { y: -18, duration: 0.3, yoyo: true, repeat: 1, ease: "sine.inOut" }, 0.4);
+tl.to(st, { scale: 0, opacity: 0, rotation: 30 * k, duration: 0.2, ease: "back.in(2)" }, 1.28);
+CF.done(tl, 1.5);
+</script>
+</body></html>

@@ -1,0 +1,28 @@
+# local environment and installs
+.venv/
+motion/node_modules/
+motion/node/
+__pycache__/
+*.pyc
+.gradio/
+motion/templates/.hyperframes/
+
+# secrets (never commit)
+settings.json
+youtube_token.json
+client_secret*.json
+
+# generated data
+cache/
+output/
+assets/
+youtube_queue.json
+live_diag.txt
+
+# your media (large; not code)
+gameplay/
+bgms/
+sounds/*.mp3
+sounds/*.wav
+*.mp4
+*.lnk

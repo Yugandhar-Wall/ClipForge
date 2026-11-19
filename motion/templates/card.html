@@ -1,0 +1,45 @@
+<!doctype html>
+<html data-composition-variables='[
+ {"id":"text","type":"string","label":"Text","default":"#3"},
+ {"id":"y","type":"number","label":"Centre Y","default":450}
+]'>
+<head><meta charset="utf-8"><link rel="stylesheet" href="common.css">
+<style>
+.num { font-size: 270px; line-height: 1; color: #fff; -webkit-text-stroke: 16px #000; paint-order: stroke fill;
+  filter: drop-shadow(0 14px 0 rgba(0,0,0,.55)); }
+.ring { position: absolute; width: 360px; height: 360px; border-radius: 50%; border: 18px solid #FFD400; box-sizing: border-box; }
+.ray { position: absolute; width: 22px; height: 90px; background: #FFD400; border-radius: 11px; }
+</style>
+<script src="common.js"></script><script src="gsap.min.js"></script></head>
+<body>
+<div id="root" data-composition-id="root" data-width="1080" data-height="1920" data-start="0" data-duration="1.2">
+  <div class="ring" id="ring"></div>
+  <div class="center" id="wrap"><div class="num" id="num"></div></div>
+</div>
+<script>
+const V = CF.vars(), root = document.getElementById("root");
+const num = document.getElementById("num"), ring = document.getElementById("ring");
+num.textContent = String(V.text || "#1");
+document.getElementById("wrap").style.top = (V.y - num.offsetHeight / 2) + "px";
+ring.style.left = (540 - 180) + "px"; ring.style.top = (V.y - 180) + "px";
+const rays = [];
+for (let i = 0; i < 10; i++) {
+  const r = document.createElement("div"); r.className = "ray";
+  const a = i * 36;
+  r.style.left = (540 - 11) + "px"; r.style.top = (V.y - 45) + "px";
+  root.insertBefore(r, ring); rays.push([r, a]);
+}
+const tl = gsap.timeline({ paused: true });
+tl.fromTo(num, { scale: 3.4, rotation: -20, opacity: 0 }, { scale: 1, rotation: 0, opacity: 1, duration: 0.26, ease: "power4.in" }, 0);
+tl.fromTo(ring, { scale: 0.3, opacity: 1 }, { scale: 2.3, opacity: 0, duration: 0.55, ease: "power2.out" }, 0.26);
+rays.forEach(([r, a]) => {
+  const rad = a * Math.PI / 180;
+  tl.set(r, { rotation: a + 90, opacity: 0 }, 0);
+  tl.fromTo(r, { x: Math.cos(rad) * 120, y: Math.sin(rad) * 120, opacity: 1, scaleY: 1 },
+               { x: Math.cos(rad) * 330, y: Math.sin(rad) * 330, opacity: 0, scaleY: 0.3, duration: 0.45, ease: "power2.out" }, 0.26);
+});
+tl.to(num, { y: 14, duration: 0.05, yoyo: true, repeat: 3, ease: "none" }, 0.26);
+tl.fromTo(num, { scale: 1 }, { scale: 1.08, duration: 0.12, yoyo: true, repeat: 1 }, 0.5);
+CF.done(tl, 1.2);
+</script>
+</body></html>

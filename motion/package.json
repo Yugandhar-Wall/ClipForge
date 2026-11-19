@@ -1,0 +1,10 @@
+{
+  "name": "clipforge-motion",
+  "private": true,
+  "description": "Motion graphics for ClipForge (HyperFrames + GSAP). Installed by setup_motion.bat.",
+  "dependencies": {
+    "hyperframes": "0.9.31",
+    "gsap": "^3.13.0",
+    "@ffprobe-installer/ffprobe": "2.1.2"
+  }
+}
