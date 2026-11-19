@@ -620,7 +620,7 @@ def _ask_for_clips(segments, signals, cfg, r0, r1, n_clips, min_len, max_len, no
                                   hot=hot, transcript=text)
         data, model, cost = chat_json(cfg["api_key"], [
             {"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-            est_tokens(prompt) + 400, out_tokens=min(8000, 600 * k + 500), model=cfg["model"],
+            est_tokens(prompt) + 400, out_tokens=min(12000, 950 * k + 500), model=cfg["model"],
             allow_free=cfg["allow_free"], validate=_validator(w0, w1, min_len, max_len, live, cfg["_lang"][0]),
             log=log)
         usage["models"].add(model)

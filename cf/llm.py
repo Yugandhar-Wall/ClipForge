@@ -73,7 +73,7 @@ def rank_models(in_tokens, out_tokens, allow_free=True, min_billion=7):
         outs = arch.get("output_modalities") or ["text"]
         if "text" not in ins or outs != ["text"]:
             continue
-        if mid.startswith("openrouter/") or _SKIP.search(mid):
+        if mid.startswith("openrouter/") or _SKIP.search(mid) or mid.endswith(":batch"):
             continue
         p_in, p_out = _price(m, "prompt"), _price(m, "completion")
         if p_in < 0 or p_out < 0:
@@ -180,6 +180,19 @@ def chat_json(key, messages, in_tokens, out_tokens=3000, model="auto", allow_fre
                 validate(parsed)
             return parsed, mid, cost
         except Exception as e:
-            errors.append(f"{mid}: bad reply ({e})")
-            log(f"  {mid} gave an unusable answer ({e}), trying next model.")
+            detail = str(e)
+            try:
+                finish = data["choices"][0].get("finish_reason")
+                n = len(content)
+                tail = content[-80:].replace("\n", " ")
+                if finish == "length" or (n and content.count("{") > content.count("}")):
+                    detail += f" - looks truncated: {n} chars, finish_reason={finish}, ends '...{tail}'"
+                elif n:
+                    detail += f" - {n} chars, ends '...{tail}'"
+                else:
+                    detail += " - reply was empty"
+            except Exception:
+                pass
+            errors.append(f"{mid}: bad reply ({detail})")
+            log(f"  {mid} gave an unusable answer ({detail}), trying next model.")
     raise LLMError("All models failed:\n" + "\n".join(errors[-8:]))

@@ -1,0 +1,57 @@
+{
+  "source": "/home/claude/clipforge/video.mp4",
+  "models": [
+    "fake/model",
+    "openai/whisper-large-v3"
+  ],
+  "est_cost_usd": 0.012,
+  "seconds": 0,
+  "clips": [
+    {
+      "file": "/home/claude/clipforge/liveout/00h05m00s_clip_01_replay_clip_number_1_what_the_hell.mp4",
+      "format": "replay",
+      "start": 49.88,
+      "end": 78.12,
+      "length": 33.4,
+      "score": 89,
+      "title": "Clip number 1 what the hell",
+      "hook": "watch this",
+      "tease": "how",
+      "cta": "would you?",
+      "caption": "so good #gta #shorts",
+      "reason": "r",
+      "trigger": "",
+      "keywords": [
+        "gta",
+        "car flip"
+      ],
+      "source": "SOURCE: 05:49 - 06:18 (time since the recording started)",
+      "campaign": "",
+      "manual_checks": [],
+      "gameplay": ""
+    },
+    {
+      "file": "/home/claude/clipforge/liveout/00h05m00s_clip_02_wait_for_it_clip_number_2.mp4",
+      "format": "wait_for_it",
+      "start": 95.08,
+      "end": 122.97,
+      "length": 27.9,
+      "score": 82,
+      "title": "Clip number 2",
+      "hook": "watch this",
+      "tease": "how",
+      "cta": "would you?",
+      "caption": "so good #gta #shorts",
+      "reason": "r",
+      "trigger": "",
+      "keywords": [
+        "gta",
+        "car flip"
+      ],
+      "source": "SOURCE: 06:35 - 07:02 (time since the recording started)",
+      "campaign": "",
+      "manual_checks": [],
+      "gameplay": ""
+    }
+  ]
+}
