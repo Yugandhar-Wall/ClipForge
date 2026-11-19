@@ -23,7 +23,7 @@ from .hype import loud_moments
 from .llm import chat_json, est_tokens
 from .render import H, layout_geometry, render_timeline
 from .settings import DEFAULTS
-from .signals import annotate, find_signals, hot_spots
+from .signals import annotate, find_signals, hot_spots, vocal_energy
 from .tools import CACHE_DIR, OUTPUT_DIR, check_stop, fmt_ts, parse_ts, probe, slug
 from .transcribe import file_key, transcribe_auto
 
@@ -41,20 +41,30 @@ SFX_NAMES = {
     "record_scratch": "sudden awkward stop, 'wait... what?', things going very wrong",
 }
 
-SYSTEM = """You are a top short-form editor who turns long gaming streams (GTA, playthroughs, streamer content) into Shorts/TikToks/Reels that people watch to the end and share.
+SYSTEM = """You are the editor behind the biggest streamer-clip channels. You turn long gaming streams and streamer content into Shorts/TikToks/Reels that strangers watch to the end, rewatch and send to friends.
 
-Judge moments by UNDERSTANDING what is happening in the transcript, not by volume. Great clips usually have:
-- a clear mini-story: setup -> escalation -> payoff/reaction, understandable with zero context
-- a genuine reaction: shock ("oh no", "no way", "what the..."), swearing, panic, laughter, rage, disbelief, hype ("let's go")
-- a dramatic beat: a sudden silence after something happens, a stunned pause, a long "...", then the reaction
-- funny banter, roasts, quotable lines, chat interactions, fails, glitches, near-misses, chases, crashes, wins
-Skip: menus, loading, ads/sponsor reads, "subscribe" talk, long explanations, dead air with nothing happening.
+WHY PEOPLE WATCH A CLIP - judge every moment by this, not by "is it funny?":
+- Hook: in the first 2-3 seconds a line, a scream or a situation opens a question the viewer needs answered ("why is he running?", "is he about to lose everything?").
+- Stakes: something can be won or lost - money, a fight, a run, a bet, pride, a friendship on stream. No stakes, no tension.
+- A real emotional peak from the streamer: rage, panic, shock, disbelief, pure hype, embarrassment, cringe, laughing hard AT something. Viewers feel what the streamer feels: the bigger and more honest the reaction, the better.
+- Payoff: the tension resolves inside the clip (the escape works or fails spectacularly, the plan backfires, the comeback lands) and the reaction lands on it.
+- Zero context: a stranger who never saw this stream understands it within a second.
+- A reason to share or comment: "this is so me", a quotable line, an absurd situation, a hot take or argument, someone getting what they deserve, an underdog win, a rivalry, something people will argue about.
 
-The transcript is annotated by an automatic detector:
-  <<exclaim:...>> exclamation/swearing   <<laugh>> laughter   <<fast>> rapid excited talking
-  <<loud>> audio spike (scream, explosion, crash)   ...(N s silence)... a sudden pause mid-conversation
-These are hints, not the answer: a quiet clever line can beat a scream, and a scream with no context is weak.
-Start each clip 1-4 s before the setup line (never mid-sentence), end 0.5-2 s after the reaction lands.
+THE STREAMER IS THE SIGNAL. Read what the streamer says and how they say it: shouting, swearing, slang ("ain't no way", "bro is cooked", "chat is this real", "nah nah nah"), exclamations, voice cracks, repeated words, rapid panicked talk, a sudden stunned silence. Live chat, when present, is a weak hint: it spams constantly (greetings, W/L, emotes, copypasta), so it can only confirm a moment the streamer already shows - never pick a moment because of chat.
+
+REJECT (score under 40), however loud it is or however much chat reacted:
+- laughing or yelling with no clear cause in the transcript; inside jokes and callbacks that need earlier context
+- reading donations, subs or raids; greeting chat; chatting about nothing; sponsor reads; "like and subscribe"
+- menus, loading, setup, tutorials, long explanations, AFK, dead air
+- a moment whose payoff hasn't happened yet or happens outside the clip
+
+The transcript is annotated by an automatic detector (hints, not the answer):
+  <<exclaim:...>> exclamation/slang/swearing   <<shout:+N dB voice>> said much louder than the streamer usually talks
+  <<laugh>> laughter   <<fast>> rapid excited talking   <<loud>> audio spike (scream, explosion, crash)
+  ...(N s silence)... a sudden pause mid-conversation   <<chat:...>> live-chat burst (weak hint)
+A quiet devastating line can beat a scream; a scream with no story is weak.
+Start each clip 1-4 s before the setup line (never mid-sentence) so the hook is in the first seconds, and end 0.5-2 s after the reaction lands. No slow lead-in: the first 3 seconds decide whether anyone stays.
 Reply with ONLY a JSON object, no prose."""
 
 USER_TMPL = """Video: {hint}
@@ -66,8 +76,9 @@ For each clip write:
 - "title": viral YouTube Shorts title, max 70 chars, curiosity-driven but TRUE to what happens (no fake claims), may use 1 emoji
 - "hook": on-screen text for the first 3 seconds, max 7 words, makes people stay (tease the payoff, don't spoil it)
 - "caption": TikTok/Instagram caption, 1-2 short sentences + 4-6 relevant hashtags
-- "score": 1-100 how likely it goes viral (be strict; average moments are 40-60)
-- "reason": one short sentence: what happens and why people will watch it
+- "scores": {{"hook": 0-25, "emotion": 0-25, "payoff": 0-20, "context": 0-15, "share": 0-15}}: hook = how strongly the first 3 s make people stay; emotion = how big and genuine the streamer's reaction is; payoff = whether the tension resolves inside the clip; context = how well a stranger understands it (15 = no context needed); share = how likely people send it to a friend or comment. Be strict: an average stream moment totals 40-60, only real standouts pass 80
+- "trigger": the main reason people will watch, 2-5 words (e.g. "rage after a betrayal", "near-miss escape", "absurd glitch", "underdog clutch")
+- "reason": one short sentence: what happens and why it hooks
 - "payoff": the single peak second (absolute) - the crash/kill/scream/punchline everything builds to
 - "format": the edit style that fits this moment best, one of:
 {formats}
@@ -82,7 +93,7 @@ Use a mix of formats across the clips - not all the same.
 Language: write title, hook, tease, cta, label and caption in the language the audience speaks (the transcript's language). For Hindi/Urdu transcripts use Hinglish (Hindi written in English letters, e.g. "Bhai ne kya kar diya 😭") - never Devanagari for on-screen text.
 
 JSON format:
-{{"clips":[{{"start":12.3,"end":45.6,"payoff":38.2,"format":"cold_open","title":"...","hook":"...","tease":"...","cta":"...","label":"...","caption":"...","score":87,"reason":"...","keywords":["..."],"sfx":[{{"t":20.1,"name":"impact"}}]}}]}}
+{{"clips":[{{"start":12.3,"end":45.6,"payoff":38.2,"format":"cold_open","title":"...","hook":"...","tease":"...","cta":"...","label":"...","caption":"...","scores":{{"hook":22,"emotion":21,"payoff":17,"context":13,"share":12}},"trigger":"...","reason":"...","keywords":["..."],"sfx":[{{"t":20.1,"name":"impact"}}]}}]}}
 
 HOT SPOTS found by the detector (start second, strength, kinds) - check these first, but read the transcript around them:
 {hot}
@@ -136,6 +147,29 @@ def _snap(clip, words, total, min_len, max_len, lo=0.0):
     if e - s > max_len:
         e = s + max_len
     return s, e
+
+
+SCORE_PARTS = {"hook": 25, "emotion": 25, "payoff": 20, "context": 15, "share": 15}
+
+
+def _total_score(c):
+    """The clip's score = the sum of the rubric parts (each clamped to its maximum). Falls back
+    to a plain "score" when a model didn't return the parts."""
+    parts = c.get("scores")
+    if isinstance(parts, dict):
+        total, out_of = 0.0, 0
+        for k, cap in SCORE_PARTS.items():
+            try:
+                total += min(cap, max(0.0, float(parts.get(k))))
+                out_of += cap
+            except (TypeError, ValueError):
+                pass
+        if out_of >= 60:          # at least 3 parts: scale what's there to 100
+            return int(round(total * 100 / out_of))
+    try:
+        return int(round(float(c.get("score") or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _score(c):
@@ -225,7 +259,7 @@ def _write_meta(path, meta):
         f.write(f"TITLE:\n{meta['title']}\n\nCAPTION:\n{meta['caption']}\n\n"
                 f"FORMAT: {meta['format']}\nHOOK TEXT: {meta['hook']}\nTEASE: {meta.get('tease', '')}\n"
                 f"END QUESTION: {meta.get('cta', '')}\n\n{meta['source']}   SCORE: {meta['score']}\n"
-                f"WHY: {meta['reason']}\n")
+                f"WHY: {(meta['trigger'] + ' - ') if meta.get('trigger') else ''}{meta['reason']}\n")
         kws = meta.get("keywords") or []
         f.write(f"\nKEYWORDS ({len(kws)}):\n{', '.join(kws) if kws else 'none - no transcript for this clip'}\n")
         if meta.get("gameplay"):
@@ -239,7 +273,7 @@ def _write_meta(path, meta):
 
 LIVE_TASK = """This is the newest part of a LIVE stream that is checked every few minutes while it happens.
 Return ONLY moments that would genuinely go viral as a Short (score {min_score} or higher), at most {k}. Most parts of a stream have NO such moment: then reply {{"clips": []}} and nothing else is needed. Never pad the answer with average moments.
-A <<chat:...>> tag means live chat exploded there; the moment that caused it is in the few seconds BEFORE the tag. A moment that both reads well in the transcript and made chat explode is the strongest pick.
+A <<chat:...>> tag marks a live-chat burst; whatever caused it happened a few seconds BEFORE the tag. Chat is a weak hint: it can confirm a moment the streamer's own words and voice already show, never justify one on its own.
 {seen}If a moment is still unfolding in the last seconds of this part (its reaction hasn't landed yet), leave it out: the next check will see all of it.
 {chat}
 """
@@ -370,6 +404,7 @@ def process(source, cfg, log=print, live=None):
                 "title": c.get("title", "") + (" (Part 2)" if suffix == "_part2" else ""),
                 "hook": c.get("hook", ""), "tease": c.get("tease", ""), "cta": c.get("cta", ""),
                 "caption": c.get("caption", ""), "reason": c.get("reason", ""),
+                "trigger": c.get("trigger", ""),
                 "keywords": c.get("keywords") or [],
                 "source": f"SOURCE: {fmt_ts(s + offset)} - {fmt_ts(e + offset)}"
                           + (" (time since the recording started)" if live else
@@ -463,7 +498,7 @@ def _listen(source, info, cfg, r0, r1, log, live):
                 for sg in tr["segments"]]
     words = [w for s in segments for w in s["words"]]
     loud = [{**m, "t": m["t"] + r0} for m in loud_moments(wav)]
-    signals = find_signals(segments, loud, info["duration"])
+    signals = find_signals(segments, loud, info["duration"], voice=vocal_energy(segments, wav, offset=r0))
     if live and live.get("chat_signals"):
         signals = sorted(signals + list(live["chat_signals"]), key=lambda x: x["t"])
     kinds = {}
@@ -582,7 +617,8 @@ def _validator(w0, w1, min_len, max_len, live):
         for c in clips:
             if not isinstance(c, dict):
                 continue
-            for key in ("title", "hook", "caption", "tease", "cta", "label", "format", "reason"):
+            c["score"] = _total_score(c)
+            for key in ("title", "hook", "caption", "tease", "cta", "label", "format", "reason", "trigger"):
                 v = c.get(key)
                 if isinstance(v, list):
                     c[key] = " ".join(str(x) for x in v)
