@@ -17,6 +17,8 @@ import threading
 import time
 from collections import Counter
 
+from .tools import NO_WINDOW
+
 BUCKET = 5.0     # seconds per bucket when looking for bursts
 LAG = 4.0        # viewers type a few seconds after the moment
 _REPEAT = re.compile(r"(.)\1{2,}")
@@ -103,10 +105,9 @@ class YouTubeChat(threading.Thread):
         while not self._stop.is_set() and starts < 6:
             starts += 1
             base = os.path.join(self.workdir, f"chat{starts}")
-            flags = 0x08000000 if sys.platform == "win32" else 0
             try:
                 self.proc = subprocess.Popen(self._cmd(base), stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.DEVNULL, creationflags=flags)
+                                             stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
             except Exception as e:
                 self.log(f"Chat reader couldn't start ({e}); using speech only.")
                 return

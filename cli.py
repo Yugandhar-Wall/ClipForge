@@ -16,8 +16,7 @@ from cf.brand import store_logo
 from cf.pipeline import process
 from cf.rules import read_rules_file
 from cf.settings import load_settings
-
-VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".m4v")
+from cf.tools import VIDEO_EXT
 
 
 def main():

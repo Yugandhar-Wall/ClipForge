@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from .tools import ROOT
+from .tools import ROOT, read_json
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -232,11 +232,7 @@ def metadata(clip, category="20"):
 
 # ------------------------------------------------------------------ queue
 def load_queue():
-    try:
-        with open(QUEUE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    return read_json(QUEUE_FILE, [])
 
 
 def _save_queue(q):

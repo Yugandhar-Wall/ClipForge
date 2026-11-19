@@ -1,31 +1,20 @@
-"""Local speech-to-text with faster-whisper (free, runs on your PC, word timestamps)."""
+"""Speech-to-text: cloud Whisper (cloud_stt.py) with local faster-whisper as the fallback.
+Local is free and runs on your PC; both give word timestamps."""
 import hashlib
-import json
 import os
-import wave
 
-import numpy as np
-
-from .tools import CACHE_DIR, run_ffmpeg
+from .audio import STT_PROMPT, read_speech
+from .cloud_stt import MODELS as CLOUD_MODELS, CloudSTTError, transcribe_cloud
+from .tools import CACHE_DIR, read_json, write_json
 
 _MODELS = {}
+LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
 
 def file_key(path):
     st = os.stat(path)
     h = hashlib.sha1(f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}".encode())
     return h.hexdigest()[:16]
-
-
-def extract_audio(video, wav_out, start=None, end=None):
-    """start/end in seconds of the source; the wav then starts at `start` (sample-accurate)."""
-    cut = []
-    if start:
-        cut += ["-ss", f"{start:.3f}"]
-    if end is not None:
-        cut += ["-t", f"{end - (start or 0):.3f}"]
-    run_ffmpeg(cut[:2] + ["-i", video] + cut[2:] +
-               ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_out])
 
 
 def _device():
@@ -43,14 +32,10 @@ def _device():
 
 
 def transcribe(wav, model_size="small", language=None, log=print, cache_key=None):
-    cache = None
-    if cache_key:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        cache = os.path.join(CACHE_DIR, f"{cache_key}_{model_size}_v2.json")
-        if os.path.exists(cache):
-            log("Transcript found in cache, skipping transcription.")
-            with open(cache, encoding="utf-8") as f:
-                return json.load(f)
+    cache = os.path.join(CACHE_DIR, f"{cache_key}_{model_size}_v2.json") if cache_key else None
+    if cache and os.path.exists(cache):
+        log("Transcript found in cache, skipping transcription.")
+        return read_json(cache)
 
     from faster_whisper import WhisperModel
     device, compute = _device()
@@ -63,16 +48,11 @@ def transcribe(wav, model_size="small", language=None, log=print, cache_key=None
 
     # Hand Whisper the samples ourselves: faster-whisper's own loader breaks with
     # newer PyAV releases (av.open(metadata_errors=...) was removed in PyAV 19).
-    with wave.open(wav, "rb") as w:
-        if w.getframerate() != 16000 or w.getnchannels() != 1:
-            raise RuntimeError("expected 16 kHz mono wav")
-        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    audio = read_speech(wav)
     segments, info = model.transcribe(
         audio, language=language or None, word_timestamps=True,
-        # Whisper normally "cleans up" speech and drops interjections. Priming every
-        # 30 s window (hotwords; initial_prompt would only cover the first one) with a
-        # messy, exclamation-heavy example makes it keep "oh no", "nooo", "what?!".
-        hotwords="Uh, oh no! Nooo, no no no... What?! Bro, are you kidding me? Haha, let's go! Oh shit. Wait... huh?",
+        # hotwords prime every 30 s window (initial_prompt would only cover the first one)
+        hotwords=STT_PROMPT,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 700, "speech_pad_ms": 400, "threshold": 0.4},
         condition_on_previous_text=False)
@@ -89,23 +69,18 @@ def transcribe(wav, model_size="small", language=None, log=print, cache_key=None
             last_report = seg.end
             log(f"  transcribed {seg.end/60:.1f}/{info.duration/60:.1f} min")
     if cache:
-        with open(cache, "w", encoding="utf-8") as f:
-            json.dump(out, f)
+        write_json(cache, out)
     return out
-
-
-LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
 
 def transcribe_auto(wav, cfg, log=print, cache_key=None):
     """Cloud (OpenRouter) when chosen, with automatic fallback: the other cloud model, then
     local Whisper. The returned dict may carry "cost" (USD) and "engine"."""
-    from .cloud_stt import MODELS, CloudSTTError, transcribe_cloud
     choice = cfg.get("whisper_model") or "small"
     lang = cfg.get("language") or None
     if choice.startswith("cloud:"):
         first = choice[len("cloud:"):]
-        for model in [first] + [m for m in MODELS if m != first]:
+        for model in [first] + [m for m in CLOUD_MODELS if m != first]:
             try:
                 return transcribe_cloud(wav, cfg.get("api_key"), model, lang, log, cache_key)
             except CloudSTTError as e:

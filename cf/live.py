@@ -25,14 +25,14 @@ from collections import deque
 
 from . import chat as CH
 from . import publish as PUB
-from .pipeline import _js_runtimes, process
-from .tools import CACHE_DIR, OUTPUT_DIR, ffmpeg_exe, fmt_ts, hls_input_opts, is_hls, probe, run_ffmpeg, slug
+from .pipeline import process
+from .tools import (CACHE_DIR, NO_WINDOW, OUTPUT_DIR, ffmpeg_exe, fmt_ts, hls_input_opts, is_hls,
+                    js_runtimes, node_exe, probe, run_ffmpeg, slug, strip_ansi)
 from .transcribe import file_key
 
 LIVE_DIR = os.path.join(CACHE_DIR, "live")
 _WAIT_WORDS = ("will begin", "offline", "not currently live", "premieres in", "is upcoming",
                "not live", "starts in", "has not started", "waiting for")
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class LiveError(RuntimeError):
@@ -56,7 +56,7 @@ def resolve(url):
     import yt_dlp
     base = {"quiet": True, "no_warnings": True, "noprogress": True, "skip_download": True,
             "noplaylist": True, "socket_timeout": 30, "extractor_retries": 2,
-            "js_runtimes": _js_runtimes(), "logger": _Quiet()}
+            "js_runtimes": js_runtimes(), "logger": _Quiet()}
     info, last = None, None
     for fmt in ("b[protocol^=m3u8][height<=1080]/b[height<=1080]/b", "bv*[height<=1080]+ba/bv*+ba/b"):
         try:
@@ -64,7 +64,7 @@ def resolve(url):
                 info = y.extract_info(url, download=False)
             break
         except Exception as e:
-            msg = _ANSI.sub("", str(e)).strip()
+            msg = strip_ansi(e).strip()
             last = msg
             if "Requested format is not available" in msg:
                 continue
@@ -278,8 +278,7 @@ class LiveSession:
         if self._chat_reader:
             self._chat = self._chat_reader(self.chatbuf)
         else:
-            node = (_js_runtimes().get("node") or {}).get("path")
-            self._chat = CH.reader_for(self.url, self.chatbuf, self.work, self.log, node)
+            self._chat = CH.reader_for(self.url, self.chatbuf, self.work, self.log, node_exe())
         if self._chat:
             self._chat.start()
             self.log(f"Reading {getattr(self._chat, 'name_', 'live chat')}.")
@@ -301,6 +300,19 @@ class LiveSession:
             self._stop.set()
 
     # ------------------------------------------------------------ recorder
+    @property
+    def _reclog_path(self):
+        return self._reclog or os.path.join(self.work, "recorder.log")
+
+    def _popen(self, cmd, **kw):
+        """Start a recorder process with its output appended to the recorder log."""
+        logf = open(self._reclog_path, "ab")
+        try:
+            return subprocess.Popen(cmd, stdout=kw.pop("stdout", logf), stderr=logf,
+                                    creationflags=NO_WINDOW, **kw)
+        finally:
+            logf.close()
+
     def _seg_args(self, idx):
         return ["-c", "copy", "-f", "segment", "-segment_time", str(self.seg_len),
                 "-segment_format", "mpegts", "-reset_timestamps", "1",
@@ -309,7 +321,7 @@ class LiveSession:
     def _spawn_pipe(self, idx):
         """yt-dlp downloads the live stream (it keeps up with YouTube's changes) and streams it
         into ffmpeg, which only cuts it into pieces."""
-        node = (_js_runtimes().get("node") or {}).get("path")
+        node = node_exe()
         dl = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist", "--no-part",
               "-f", "b[vcodec!=?none][acodec!=?none][height<=?1080]/b[vcodec!=?none][acodec!=?none]",
               "--hls-use-mpegts", "--retries", "10", "--fragment-retries", "10",
@@ -319,16 +331,10 @@ class LiveSession:
         dl.append(self.url)
         ff = [ffmpeg_exe(), "-hide_banner", "-loglevel", "warning", "-y", "-i", "pipe:0",
               "-map", "0:v:0", "-map", "0:a:0?"] + self._seg_args(idx)
-        logf = open(self._reclog or os.path.join(self.work, "recorder.log"), "ab")
-        flags = 0x08000000 if sys.platform == "win32" else 0
-        try:
-            self._feeder = subprocess.Popen(dl, stdout=subprocess.PIPE, stderr=logf, stdin=subprocess.DEVNULL,
-                                            creationflags=flags)
-            proc = subprocess.Popen(ff, stdin=self._feeder.stdout, stdout=logf, stderr=logf, creationflags=flags)
-            self._feeder.stdout.close()        # ffmpeg owns the pipe now; it sees the end when yt-dlp stops
-            return proc
-        finally:
-            logf.close()
+        self._feeder = self._popen(dl, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        proc = self._popen(ff, stdin=self._feeder.stdout)
+        self._feeder.stdout.close()        # ffmpeg owns the pipe now; it sees the end when yt-dlp stops
+        return proc
 
     def _spawn(self, info, idx):
         if self._modes[0] == "pipe":
@@ -346,13 +352,7 @@ class LiveSession:
             cmd += ["-i", url]
         a = len(info["inputs"]) - 1
         cmd += ["-map", "0:v:0", "-map", f"{a}:a:0?"] + self._seg_args(idx)
-        logf = open(self._reclog or os.path.join(self.work, "recorder.log"), "ab")
-        flags = 0x08000000 if sys.platform == "win32" else 0
-        try:
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf,
-                                    creationflags=flags)
-        finally:
-            logf.close()
+        return self._popen(cmd, stdin=subprocess.PIPE)
 
     def _seg_files(self):
         try:
@@ -441,14 +441,14 @@ class LiveSession:
 
     def _rec_note(self, text):
         try:
-            with open(self._reclog or os.path.join(self.work, "recorder.log"), "a", encoding="utf-8") as f:
+            with open(self._reclog_path, "a", encoding="utf-8") as f:
                 f.write(f"\n===== {time.strftime('%H:%M:%S')} {text}\n")
         except OSError:
             pass
 
     def _rec_tail(self, n=6):
         try:
-            with open(self._reclog or os.path.join(self.work, "recorder.log"), "rb") as f:
+            with open(self._reclog_path, "rb") as f:
                 text = f.read()[-6000:].decode("utf-8", "replace")
         except OSError:
             return "none"
@@ -530,17 +530,12 @@ class LiveSession:
 
     def _concat(self, idxs, out_base):
         """Join pieces without re-encoding. Returns the file path."""
-        lst = os.path.join(self.work, "join.txt")
-        with open(lst, "w", encoding="utf-8") as f:
-            for i in idxs:
-                f.write(f"file '{os.path.basename(self._segs[i]['path'])}'\n")
+        names = [os.path.basename(self._segs[i]["path"]) for i in idxs]
         last = None
         for ext, extra in ((".mp4", ["-movflags", "+faststart"]), (".mkv", [])):
             out = out_base + ext
             try:
-                run_ffmpeg(["-f", "concat", "-safe", "0", "-i", "join.txt", "-map", "0:v:0", "-map", "0:a:0?",
-                            "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]
-                           + extra + [os.path.abspath(out)], cwd=self.work)
+                join_pieces(names, out, self.work, extra)
                 return out
             except Exception as e:
                 last = e
@@ -708,16 +703,21 @@ class LiveSession:
         if not names:
             return
         try:
-            with open(os.path.join(keep, "join.txt"), "w", encoding="utf-8") as f:
-                f.writelines(f"file '{n}'\n" for n in names)
             out = os.path.join(self.out_dir, "full_recording.mp4")
-            run_ffmpeg(["-f", "concat", "-safe", "0", "-i", "join.txt", "-map", "0:v:0", "-map", "0:a:0?",
-                        "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
-                        os.path.abspath(out)], cwd=keep)
+            join_pieces(names, out, keep)
             shutil.rmtree(keep, ignore_errors=True)
             self.log(f"Full recording saved: {out}")
         except Exception:
             self.log(f"Full recording kept as pieces in {keep}")
+
+
+def join_pieces(names, out, folder, extra=()):
+    """Join recorded .ts pieces (file names inside `folder`) into one file without re-encoding."""
+    with open(os.path.join(folder, "join.txt"), "w", encoding="utf-8") as f:
+        f.writelines(f"file '{n}'\n" for n in names)
+    run_ffmpeg(["-f", "concat", "-safe", "0", "-i", "join.txt", "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", *extra,
+                os.path.abspath(out)], cwd=folder)
 
 
 # ------------------------------------------------------------ one session at a time

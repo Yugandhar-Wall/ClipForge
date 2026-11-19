@@ -37,6 +37,26 @@ def ready(s):
     return True, ""
 
 
+def retry_share_tunnel(errors):
+    """Gradio hides why a share link failed: keep the real reason (appended to `errors`) and
+    retry once."""
+    import time
+    import gradio.networking as gnet
+    orig = gnet.setup_tunnel
+
+    def tunnel(*a, **k):
+        for attempt in (1, 2):
+            try:
+                return orig(*a, **k)
+            except Exception as e:
+                errors.append(e)
+                if attempt == 1:
+                    print("Share link attempt 1 failed, retrying...")
+                    time.sleep(3)
+        raise errors[-1]
+    gnet.setup_tunnel = tunnel
+
+
 def explain_share_error(err):
     """Turn Gradio's hidden share-link failure into a reason and a fix."""
     if err is None:

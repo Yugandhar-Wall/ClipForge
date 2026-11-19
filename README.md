@@ -199,3 +199,29 @@ your local fallback model, so a run never stops because of it.
 - NVIDIA GPU: set environment variable `CLIPFORGE_GPU=1` (needs CUDA 12 cuBLAS/cuDNN).
 - YouTube URLs use yt-dlp; if YouTube blocks it, download the video and use the file.
 - "Try free models first" is off by default: free models are heavily rate-limited.
+
+## Code map
+| File | What it does |
+|---|---|
+| `app.py` | The web app (Gradio): pages, buttons, settings form |
+| `cli.py` | Batch mode / command line (`batch.bat`) |
+| `cf/pipeline.py` | `process()`: one video in, finished clips out. Calls everything below, step by step |
+| `cf/live.py` | Live-stream monitor: recorder, periodic checks, cleanup |
+| `cf/chat.py` | Live chat readers (YouTube, Twitch) and chat-burst detection |
+| `cf/download.py` | Downloading videos with yt-dlp |
+| `cf/audio.py` | Audio extraction and wav reading |
+| `cf/transcribe.py`, `cf/cloud_stt.py` | Speech-to-text: cloud Whisper, local fallback |
+| `cf/hype.py`, `cf/signals.py` | Loud spikes and reaction signals (exclaims, laughs, pauses, fast talk) |
+| `cf/llm.py` | OpenRouter client: picks the cheapest model that passes the quality check |
+| `cf/rules.py` | Campaign rules: reading, AI parsing, banned words, AI review, length limits |
+| `cf/formats.py` | Edit formats (cold open, replay, wait for it...) -> timelines |
+| `cf/captions.py` | Word captions and text overlays (ASS subtitles) |
+| `cf/render.py` | Renders a timeline with ffmpeg (layout, zooms, logo, overlays, SFX, memes) |
+| `cf/motion.py` | Animated overlays (HyperFrames + GSAP) |
+| `cf/memes.py` | Meme-sound library from `sounds\` |
+| `cf/brand.py` | Sponsor logo |
+| `cf/gameplay.py` | Split-screen gameplay library |
+| `cf/publish.py` | YouTube upload queue + Telegram messages |
+| `cf/remote.py` | Phone access (share link + login) |
+| `cf/settings.py` | Saved settings and their defaults |
+| `cf/tools.py` | Shared helpers: folders, ffmpeg, Node.js, JSON files, time formats |

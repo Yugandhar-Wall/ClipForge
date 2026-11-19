@@ -5,3 +5,6 @@ requests>=2.32
 numpy>=1.26
 yt-dlp
 pypdf>=5.0
+# already installed by the packages above; listed because ClipForge imports them directly
+pillow
+av

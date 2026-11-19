@@ -6,21 +6,28 @@ Flow:
                           (length, required tags, banned words, banned edits) plus a list of
                           rules only a human can check (what is on screen, posting rules...)
   3. the full text also goes into the clip-picking prompt
-  4. review_clips()     - a separate AI pass judges every picked clip (its transcript and
-                          all generated text) against the rules; anything not passing is dropped
-  5. enforce_text()     - required hashtags/mentions/phrases are added to the caption,
-                          banned words are checked in speech and in every generated text
+  4. filter_clips()     - required hashtags/mentions/phrases are added to each caption
+                          (enforce_caption), banned words are checked in speech and in every
+                          generated text (banned_hits), then review_clips() - a separate AI pass -
+                          judges every clip against the full rules; anything not passing is dropped
+  5. length_window(), length_ok(), apply_disallowed() - the campaign's length limits and
+                          forbidden formats/extras are applied to the run's settings
 """
 import hashlib
-import json
+import math
 import os
 import re
 import zipfile
 
-from .llm import chat_json
-from .tools import CACHE_DIR
+from .formats import FORMATS
+from .llm import chat_json, est_tokens
+from .tools import CACHE_DIR, fmt_ts, read_json, write_json
 
 MAX_RULES_CHARS = 15000
+
+class NoCompliantClips(RuntimeError):
+    """Every candidate clip broke a campaign rule."""
+
 
 FEATURES = {
     "sound_effects": "added sound effects",
@@ -90,7 +97,6 @@ RULES:
 
 
 def _features_text():
-    from .formats import FORMATS
     lines = [f"- {k}: {v}" for k, v in FORMATS.items()]
     lines += [f"- {k}: {v}" for k, v in FEATURES.items()]
     return "\n".join(lines)
@@ -118,8 +124,7 @@ def parse_rules(text, cfg, log=print):
     key = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
     cache = os.path.join(CACHE_DIR, f"rules_{key}.json")
     if os.path.exists(cache):
-        with open(cache, encoding="utf-8") as f:
-            return json.load(f)
+        return read_json(cache)
     log("Reading the campaign rules...")
 
     def validate(d):
@@ -129,7 +134,6 @@ def parse_rules(text, cfg, log=print):
     data, model, _ = chat_json(cfg["api_key"], [{"role": "user", "content": PARSE_PROMPT.format(
         features=_features_text(), rules=text)}], in_tokens=len(text) // 3 + 900, out_tokens=1500,
         model=cfg["model"], allow_free=cfg["allow_free"], validate=validate, log=log)
-    from .formats import FORMATS
     known = set(FORMATS) | set(FEATURES)
     r = {
         "text": text,
@@ -148,9 +152,7 @@ def parse_rules(text, cfg, log=print):
     }
     if r["min_len"] and r["max_len"] and r["min_len"] > r["max_len"]:
         r["min_len"], r["max_len"] = r["max_len"], r["min_len"]
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump(r, f, indent=2, ensure_ascii=False)
+    write_json(cache, r, indent=2)
     return r
 
 
@@ -185,6 +187,11 @@ def prompt_block(r):
             "Rules about what is on screen can't be checked from the transcript: prefer moments that "
             "are clearly safe for them.\n" + "\n".join(extra) +
             "\nFULL RULES:\n<<<\n" + r["text"] + "\n>>>\n")
+
+
+def transcript_between(words, s, e):
+    """What is said in a clip (words starting within 0.3 s of its edges)."""
+    return " ".join(w["w"] for w in words if s - 0.3 <= w["s"] <= e + 0.3)
 
 
 def _norm(s):
@@ -235,7 +242,7 @@ def review_clips(r, clips, words, cfg, log=print, models_used=None):
     """clips: dicts with s, e and the text fields. Returns {index: (verdict, reasons)}."""
     blocks = []
     for i, c in enumerate(clips, start=1):
-        said = c.get("_said") or " ".join(w["w"] for w in words if c["s"] - 0.3 <= w["s"] <= c["e"] + 0.3)
+        said = c.get("_said") or transcript_between(words, c["s"], c["e"])
         blocks.append(f"--- id {i} ---\nTRANSCRIPT: {said}\nTITLE: {c.get('title', '')}\n"
                       f"ON-SCREEN TEXT: {c.get('hook', '')} | {c.get('tease', '')} | {c.get('cta', '')} | "
                       f"{c.get('label', '')}\nCAPTION: {c.get('caption', '')}")
@@ -255,7 +262,6 @@ def review_clips(r, clips, words, cfg, log=print, models_used=None):
         if not ids <= seen:
             raise ValueError(f"verdicts missing for {sorted(ids - seen)}")
 
-    from .pipeline import est_tokens
     data, model, cost = chat_json(cfg["api_key"], [{"role": "user", "content": prompt}],
                                   est_tokens(prompt) + 300, out_tokens=120 * len(clips) + 300,
                                   model=cfg["model"], allow_free=cfg["allow_free"],
@@ -271,3 +277,72 @@ def review_clips(r, clips, words, cfg, log=print, models_used=None):
         verdict = str(x.get("verdict", "")).strip().lower()
         out[i - 1] = ("pass" if verdict == "pass" else "fail", _str_list(x.get("broken")))
     return out, cost or 0.0
+
+
+# ---------------------------------------------------------------- applying the rules to a run
+def length_ok(length, rules, tol=0.5):
+    lo, hi = rules.get("min_len"), rules.get("max_len")
+    return (not lo or length >= lo - tol) and (not hi or length <= hi + tol)
+
+
+def length_window(min_len, max_len, rules, log):
+    """Clip length window that satisfies both the user's sliders and the campaign."""
+    lo, hi = rules.get("min_len"), rules.get("max_len")
+    new_min = max(min_len, int(math.ceil(lo))) if lo else min_len
+    new_max = min(max_len, int(hi)) if hi else max_len
+    if new_min > new_max:  # sliders conflict with the campaign: the campaign wins
+        new_min = int(math.ceil(lo)) if lo else min(min_len, new_max)
+        new_max = int(hi) if hi else max(max_len, new_min)
+    if (new_min, new_max) != (min_len, max_len):
+        log(f"  clip length set to {new_min}-{new_max}s to match the campaign rules.")
+    return new_min, new_max
+
+
+def apply_disallowed(cfg, rules, log):
+    """Switch off the formats and extras the campaign forbids (cfg is changed in place)."""
+    off = rules["disallowed"]
+    if not off:
+        return
+    fmts = [f for f in cfg["formats"] if f not in off]
+    cfg["formats"] = fmts or ["standard"]
+    for feat, key in (("countdown", "top_n_on"), ("sound_effects", "sfx_on"),
+                      ("end_question", "cta_on"), ("zoom_effects", "punch_on"),
+                      ("progress_bar", "progress_on")):
+        if feat in off:
+            cfg[key] = False
+    log("  turned off for this campaign: " + ", ".join(off))
+
+
+def filter_clips(chosen, rules, words, cfg, log, models_used):
+    """Banned words (speech + text) are checked here; then an independent AI review judges
+    every remaining clip against the full rules. Only passing clips are kept."""
+    keep = []
+    for c in chosen:
+        said = c["_said"] = transcript_between(words, c["s"], c["e"])
+        c["caption"] = enforce_caption(rules, c.get("caption", ""))
+        hits = banned_hits(rules, [said, c.get("title"), c.get("hook"), c.get("tease"),
+                                     c.get("cta"), c.get("label"), c.get("caption"),
+                                     " ".join(c.get("keywords") or [])])
+        if hits:
+            log(f"  dropped {fmt_ts(c['s'])} '{c.get('title', '')[:40]}': banned word(s) {', '.join(hits)}")
+            continue
+        keep.append(c)
+    if not keep:
+        raise NoCompliantClips("No clip in this video complies with the campaign rules (banned words).")
+    log(f"Checking {len(keep)} candidate clips against the campaign rules...")
+    try:
+        verdicts, cost = review_clips(rules, keep, words, cfg, log, models_used)
+    except Exception as e:
+        raise RuntimeError(f"Couldn't check the clips against the campaign rules ({e}). "
+                           "Nothing was rendered, so no unchecked clip gets posted.") from e
+    passed = []
+    for i, c in enumerate(keep):
+        verdict, why = verdicts.get(i, ("fail", ["no verdict"]))
+        if verdict == "pass":
+            passed.append(c)
+        else:
+            log(f"  dropped {fmt_ts(c['s'])} '{c.get('title', '')[:40]}': {'; '.join(why) or 'breaks a rule'}")
+    log(f"  {len(passed)} of {len(keep)} clips passed the rule review.")
+    if not passed:
+        raise NoCompliantClips("No clip in this video fully complies with the campaign rules.")
+    return passed, cost

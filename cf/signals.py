@@ -127,11 +127,7 @@ def hot_spots(signals, window=20.0, top=25):
 
 def annotate(segments, signals, w0, w1):
     """Transcript lines with inline tags, e.g. [812.4] oh no no no  <<exclaim:oh no | loud>>"""
-    by_seg = {}
-    pauses = []
-    for s in signals:
-        if s["kind"] == "pause":
-            pauses.append(s)
+    pauses = [s for s in signals if s["kind"] == "pause"]
     lines = []
     seg_list = [s for s in segments if w0 <= s["s"] < w1]
     for i, seg in enumerate(seg_list):

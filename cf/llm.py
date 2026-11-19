@@ -35,7 +35,13 @@ class LLMError(RuntimeError):
     pass
 
 
-def _headers(key):
+def est_tokens(text):
+    """Latin text ~3.5 chars/token; Devanagari and other scripts ~1 token per char."""
+    ascii_n = sum(1 for ch in text if ord(ch) < 128)
+    return int(ascii_n / 3.5 + (len(text) - ascii_n) * 1.0) + 1
+
+
+def headers(key):
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
             "HTTP-Referer": "http://localhost", "X-Title": "ClipForge"}
 
@@ -142,7 +148,7 @@ def chat_json(key, messages, in_tokens, out_tokens=3000, model="auto", allow_fre
         label = "free" if cost == 0 else (f"~${cost:.4f}" if cost is not None else "")
         log(f"Asking {mid} {label}...")
         try:
-            r = requests.post(f"{API}/chat/completions", headers=_headers(key),
+            r = requests.post(f"{API}/chat/completions", headers=headers(key),
                               json=body, timeout=300)
         except requests.RequestException as e:
             errors.append(f"{mid}: {e}")

@@ -1,4 +1,5 @@
-"""Shared helpers: locating ffmpeg, running it, probing media, logging."""
+"""Shared helpers: app folders, ffmpeg (find, run, probe), Node.js, JSON files, time formats."""
+import json
 import os
 import re
 import shutil
@@ -10,8 +11,51 @@ SFX_DIR = os.path.join(ROOT, "sfx")
 FONTS_DIR = os.path.join(ROOT, "fonts")
 OUTPUT_DIR = os.path.join(ROOT, "output")
 CACHE_DIR = os.path.join(ROOT, "cache")
+MOTION_DIR = os.path.join(ROOT, "motion")
+MOTION_READY = os.path.join(MOTION_DIR, "ready.json")   # written by setup_motion.bat
+
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".flv")
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW: no console flashes up
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 _FFMPEG = None
+
+
+# ---------------------------------------------------------------- small helpers
+def strip_ansi(text):
+    """yt-dlp error messages carry terminal colour codes."""
+    return _ANSI.sub("", str(text))
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, data, indent=None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent, ensure_ascii=False)
+
+
+def node_exe():
+    """Node.js: the one setup_motion.bat found or installed, else the one on PATH."""
+    paths = [(read_json(MOTION_READY) or {}).get("node"),
+             os.path.join(MOTION_DIR, "node", "node.exe" if os.name == "nt" else "bin/node"),
+             shutil.which("node")]
+    return next((p for p in paths if p and os.path.exists(p)), None)
+
+
+def js_runtimes():
+    """For yt-dlp's YouTube challenge solver: Node.js when present (deno stays the fallback)."""
+    node = node_exe()
+    return {"node": {"path": node}, "deno": {}} if node else {"deno": {}}
+
+
+# ---------------------------------------------------------------- ffmpeg
 
 
 def _has_libass(exe):
@@ -56,10 +100,9 @@ def hls_input_opts():
     and YouTube's addresses never have one. Only options this ffmpeg knows are returned."""
     exe = ffmpeg_exe()
     if exe not in _HLS_OPTS:
-        flags = 0x08000000 if sys.platform == "win32" else 0
         try:
             h = subprocess.run([exe, "-hide_banner", "-h", "demuxer=hls"], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=20, creationflags=flags).stdout
+                               encoding="utf-8", errors="replace", timeout=20, creationflags=NO_WINDOW).stdout
         except Exception:
             h = ""
         opts = []
@@ -78,9 +121,8 @@ def is_hls(url):
 
 def run_ffmpeg(args, cwd=None, log=None):
     cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y"] + args
-    flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", creationflags=flags)
+                       encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + (p.stderr or "")[-2000:])
     return p
@@ -127,7 +169,8 @@ def parse_ts(text):
     return sec
 
 
-def fmt_ts(sec):
+def fmt_ts(sec, hours=False):
+    """62 -> '01:02'; with hours=True (or past an hour) -> '0:01:02'."""
     sec = max(0, int(sec))
     h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    return f"{h}:{m:02d}:{s:02d}" if h or hours else f"{m:02d}:{s:02d}"

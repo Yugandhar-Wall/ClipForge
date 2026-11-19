@@ -12,26 +12,25 @@ Why it is built this way:
 - Every finished piece is cached, so a re-run after a network error only sends what's missing.
 """
 import base64
-import json
 import os
 import re
 import subprocess
 import time
-import wave
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
 
-from .tools import CACHE_DIR, ffmpeg_exe
+from .audio import SPEECH_SR, STT_PROMPT, read_speech
+from .llm import API, headers
+from .tools import CACHE_DIR, ffmpeg_exe, read_json, write_json
 
-URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+URL = f"{API}/audio/transcriptions"
 MODELS = ["openai/whisper-large-v3", "openai/whisper-large-v3-turbo"]
 CHUNK = 300.0          # target seconds per request
 FRAME = 0.1            # RMS frame for silence detection
 SILENT_DB = -50.0      # piece/word quieter than this = silence
 WORKERS = 4
-PROMPT = "Uh, oh no! Nooo, no no no... What?! Bro, are you kidding me? Haha, let's go! Oh shit. Wait... huh?"
 
 
 _LANGS = {"english": "en", "hindi": "hi", "spanish": "es", "portuguese": "pt", "french": "fr",
@@ -44,14 +43,7 @@ class CloudSTTError(RuntimeError):
     pass
 
 
-def _read_wav(path):
-    with wave.open(path, "rb") as w:
-        if w.getframerate() != 16000 or w.getnchannels() != 1:
-            raise CloudSTTError("expected a 16 kHz mono wav")
-        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def _rms_db(audio, sr=16000):
+def _rms_db(audio, sr=SPEECH_SR):
     n = int(sr * FRAME)
     k = len(audio) // n
     if k == 0:
@@ -88,15 +80,13 @@ def _encode(wav, s, e):
 def _request(key, model, data, fmt, language):
     body = {"model": model, "input_audio": {"data": base64.b64encode(data).decode(), "format": fmt},
             "response_format": "verbose_json", "timestamp_granularities": ["word", "segment"],
-            "temperature": 0, "provider": {"options": {"groq": {"prompt": PROMPT}}}}
+            "temperature": 0, "provider": {"options": {"groq": {"prompt": STT_PROMPT}}}}
     if language:
         body["language"] = language
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-               "X-Title": "ClipForge"}
     last = None
     for attempt in range(4):
         try:
-            r = requests.post(URL, json=body, headers=headers, timeout=180)
+            r = requests.post(URL, json=body, headers=headers(key), timeout=180)
         except requests.RequestException as e:
             last = f"network error: {e}"
         else:
@@ -193,12 +183,11 @@ def transcribe_cloud(wav, api_key, model=MODELS[0], language=None, log=print, ca
     final = os.path.join(CACHE_DIR, f"{cache_key}_cloud-{tag}_v2.json") if cache_key else None
     if final and os.path.exists(final):
         log("Transcript found in cache, skipping transcription.")
-        with open(final, encoding="utf-8") as f:
-            return json.load(f)
+        return read_json(final)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    audio = _read_wav(wav)
-    total = len(audio) / 16000
+    audio = read_speech(wav)
+    total = len(audio) / SPEECH_SR
     db = _rms_db(audio)
     chunks = plan_chunks(db, total)
     todo = []
@@ -214,15 +203,13 @@ def transcribe_cloud(wav, api_key, model=MODELS[0], language=None, log=print, ca
         i, s, e = job
         pc = os.path.join(CACHE_DIR, f"{cache_key or 'nokey'}_cloud-{tag}_{i:03d}_{int(s)}.json")
         if os.path.exists(pc):
-            with open(pc, encoding="utf-8") as f:
-                return i, json.load(f), True
+            return i, read_json(pc), True
         data, fmt = _encode(wav, s, e)
         resp = _request(api_key, model, data, fmt, language)
         if not resp.get("words") and len(str(resp.get("text") or "").split()) > 2:
             raise CloudSTTError("the provider returned text but no word timestamps")
         if cache_key:
-            with open(pc, "w", encoding="utf-8") as f:
-                json.dump(resp, f)
+            write_json(pc, resp)
         return i, resp, False
 
     results, done, cost, t0 = {}, 0, 0.0, time.time()
@@ -249,6 +236,5 @@ def transcribe_cloud(wav, api_key, model=MODELS[0], language=None, log=print, ca
     nwords = sum(len(sg["words"]) for sg in out["segments"])
     log(f"  {nwords} words, language '{out['language'] or '?'}', cost ${cost:.4f}")
     if final:
-        with open(final, "w", encoding="utf-8") as f:
-            json.dump(out, f)
+        write_json(final, out)
     return out

@@ -6,14 +6,12 @@ Put your own videos in the `gameplay` folder, one sub-folder per game, e.g.
 Videos directly inside `gameplay` count as the game "other".
 The gameplay is always muted and never repeats the same video twice in a row.
 """
-import json
 import os
 import random
 
-from .tools import CACHE_DIR, ROOT, probe
+from .tools import CACHE_DIR, ROOT, VIDEO_EXT, probe, read_json, write_json
 
 GAMEPLAY_DIR = os.path.join(ROOT, "gameplay")
-VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi")
 ANY = "any"
 _DUR_CACHE = os.path.join(CACHE_DIR, "gameplay_durations.json")
 
@@ -34,10 +32,6 @@ def library():
     return lib
 
 
-def game_choices():
-    return [ANY] + sorted(library())
-
-
 def nice(name):
     return name.replace("_", " ").replace("-", " ").title()
 
@@ -51,11 +45,7 @@ def describe():
 
 
 def _durations(paths):
-    try:
-        with open(_DUR_CACHE, encoding="utf-8") as f:
-            cache = json.load(f)
-    except Exception:
-        cache = {}
+    cache = read_json(_DUR_CACHE, {})
     out, bad, changed = {}, [], False
     for p in paths:
         try:
@@ -70,9 +60,7 @@ def _durations(paths):
         except Exception:
             bad.append(os.path.basename(p))   # unreadable / half-downloaded: skip it
     if changed:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(_DUR_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=1)
+        write_json(_DUR_CACHE, cache, indent=1)
     return out, bad
 
 

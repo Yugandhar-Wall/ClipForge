@@ -8,7 +8,6 @@
   reveal) is measured, so the hit lands exactly on the beat the AI picked.
 """
 import hashlib
-import json
 import os
 import re
 import subprocess
@@ -16,7 +15,7 @@ import wave
 
 import numpy as np
 
-from .tools import CACHE_DIR, ROOT, ffmpeg_exe
+from .tools import CACHE_DIR, ROOT, ffmpeg_exe, read_json, write_json
 
 SOUNDS_DIR = os.path.join(ROOT, "sounds")
 CATALOG = os.path.join(SOUNDS_DIR, "sounds.txt")
@@ -101,13 +100,11 @@ def library(log=print):
         meta = wav + ".json"
         try:
             if os.path.exists(meta) and os.path.exists(wav):
-                with open(meta) as f:
-                    m = json.load(f)
+                m = read_json(meta)
             else:
                 hit, length = _prepare(src, wav)
                 m = {"hit": hit, "len": length}
-                with open(meta, "w") as f:
-                    json.dump(m, f)
+                write_json(meta, m)
         except Exception as e:
             log(f"  meme sound '{name}' skipped ({e})")
             continue

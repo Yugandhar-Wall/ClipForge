@@ -21,12 +21,10 @@ import sys
 import tempfile
 import time
 
-from .tools import CACHE_DIR, ROOT, ffmpeg_exe
+from .tools import CACHE_DIR, MOTION_DIR, MOTION_READY, NO_WINDOW, ffmpeg_exe, node_exe, read_json
 
-MOTION_DIR = os.path.join(ROOT, "motion")
 TPL_DIR = os.path.join(MOTION_DIR, "templates")
 ASSET_DIR = os.path.join(CACHE_DIR, "motion")
-READY = os.path.join(MOTION_DIR, "ready.json")
 CLI = os.path.join(MOTION_DIR, "node_modules", "hyperframes", "bin", "hyperframes.mjs")
 FPS = 30
 VERSION = "2"
@@ -41,24 +39,6 @@ _status_cache = {}
 
 
 # ---------------------------------------------------------------- setup / status
-def _ready():
-    try:
-        with open(READY, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _node():
-    r = _ready().get("node")
-    if r and os.path.exists(r):
-        return r
-    local = os.path.join(MOTION_DIR, "node", "node.exe" if os.name == "nt" else "bin/node")
-    if os.path.exists(local):
-        return local
-    return shutil.which("node")
-
-
 def _ffprobe():
     pats = ["ffprobe.exe", "ffprobe"] if os.name == "nt" else ["ffprobe"]
     for p in pats:
@@ -72,7 +52,7 @@ def status():
     """(ok, message). Cached for the session once it's OK."""
     if _status_cache.get("ok"):
         return True, _status_cache["msg"]
-    node = _node()
+    node = node_exe()
     missing = []
     if not node:
         missing.append("Node.js 22+")
@@ -99,10 +79,10 @@ def _env():
     env = dict(os.environ)
     env.update(HYPERFRAMES_FFMPEG_PATH=ffmpeg_exe(), HYPERFRAMES_FFPROBE_PATH=_ffprobe() or "",
                HYPERFRAMES_NO_TELEMETRY="1", DO_NOT_TRACK="1", HYPERFRAMES_RENDER_LOCK="off")
-    browser = _ready().get("browser")
+    browser = (read_json(MOTION_READY) or {}).get("browser")
     if browser and os.path.exists(browser):
         env["HYPERFRAMES_BROWSER_PATH"] = browser
-    node_dir = os.path.dirname(_node() or "")
+    node_dir = os.path.dirname(node_exe() or "")
     if node_dir:
         env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
     return env
@@ -175,14 +155,13 @@ def _render_batch(kind, rows, log):
     with open(batch, "w", encoding="utf-8") as f:
         json.dump([rows[k] for k in keys], f, ensure_ascii=False)
     tpl = "hook" if kind == "slam" else kind
-    cmd = [_node(), CLI, "render", TPL_DIR, "-c", f"{tpl}.html", "--format", "png-sequence",
+    cmd = [node_exe(), CLI, "render", TPL_DIR, "-c", f"{tpl}.html", "--format", "png-sequence",
            "--fps", str(FPS), "--batch", batch, "--batch-concurrency", "2",
            "-o", os.path.join(work, "r_{index}"), "--json"]
-    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            env=_env(), cwd=MOTION_DIR, timeout=120 + 40 * len(keys),
-                           creationflags=flags)
+                           creationflags=NO_WINDOW)
         out = p.stdout.strip()
         if p.returncode != 0 and not out:
             raise RuntimeError((p.stderr or "")[-400:].strip() or f"exit code {p.returncode}")
@@ -291,12 +270,12 @@ def _one_emoji(e):
 
 
 def plan(tl, clip, cfg, geo, signals):
-    """Decide the animated overlays for one finished timeline.
-    Returns (requests, event_ids_replaced); requests carry output times."""
+    """Decide the animated overlays for one finished timeline. Returns render requests (output
+    times); each request's "ev" is the index of the text event it replaces, if any."""
     on = set(cfg.get("motion_elements") or ELEMENTS)
     cap_y, hook_y = geo
     L = tl.length
-    reqs, replaced = [], []
+    reqs = []
 
     def add(kind, tpl, vars_, t0, t1, ev_id=None):
         t1 = min(t1, L)

@@ -24,18 +24,21 @@ from cf import live as LIVE
 from cf import publish as PUB
 from cf import remote as RM
 from cf.brand import ANIMATIONS, ASSETS_DIR, remove_logo, store_logo
+from cf.captions import COLORS
+from cf.cloud_stt import MODELS as CLOUD_MODELS
 from cf.formats import FORMATS
 from cf.memes import library as meme_library
 from cf.motion import ELEMENTS as MOTION_ELEMENTS, status as motion_check
-from cf.pipeline import DEFAULTS, process
+from cf.pipeline import process
 from cf.rules import read_rules_file
-from cf.settings import load_settings, save_settings, update_settings
-from cf.tools import OUTPUT_DIR
+from cf.settings import DEFAULTS, load_settings, save_settings, update_settings
+from cf.tools import OUTPUT_DIR, fmt_ts
 from cf.transcribe import LOCAL_MODELS
 
-STT_CHOICES = [("Cloud · Whisper Large V3 (best)", "cloud:openai/whisper-large-v3"),
-               ("Cloud · Whisper V3 Turbo (cheaper)", "cloud:openai/whisper-large-v3-turbo")] + [(f"Local: {m}", m) for m in LOCAL_MODELS]
-HIGHLIGHTS = ["auto", "yellow", "green", "cyan", "pink", "orange", "white"]
+STT_CHOICES = ([("Cloud · Whisper Large V3 (best)", f"cloud:{CLOUD_MODELS[0]}"),
+                ("Cloud · Whisper V3 Turbo (cheaper)", f"cloud:{CLOUD_MODELS[1]}")]
+               + [(f"Local: {m}", m) for m in LOCAL_MODELS])
+HIGHLIGHTS = ["auto"] + list(COLORS)
 
 # Saved form fields: settings key -> how to read the widget's value.
 _TEXT = lambda v: (v or "").strip()
@@ -327,12 +330,7 @@ def make_reset(w, order):
     return reset
 
 
-
 # ---------------------------------------------------------------- live monitor
-def _clock(sec):
-    sec = max(0, int(sec))
-    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
-
 
 def live_status_text(sess):
     if not sess:
@@ -345,7 +343,7 @@ def live_status_text(sess):
         head += f" · {st['title'][:80]}"
     if st["error"]:
         return head + f"\n\n{st['error']}"
-    bits = [f"running {_clock(st['elapsed'])}", f"{_clock(st['recorded'])} recorded",
+    bits = [f"running {fmt_ts(st['elapsed'], hours=True)}", f"{fmt_ts(st['recorded'], hours=True)} recorded",
             f"{st['checks']} check{'' if st['checks'] == 1 else 's'}",
             f"**{st['clips']} clip{'' if st['clips'] == 1 else 's'}**", f"{st['uploaded']} uploaded"]
     if st["next_in"] is not None:
@@ -831,7 +829,6 @@ def build():
         nav["publish"].click(queue_view, None, [yt_queue, yt_review, yt_publish], show_progress="hidden")
         order = [k for k in w]
         reset_btn.click(make_reset(w, order), None, [w[k] for k in order] + [reset_note])
-    ui.cf_widgets = w   # for tests
     return ui
 
 
@@ -849,22 +846,7 @@ if __name__ == "__main__":
               "auth_message": "ClipForge: sign in"}
     share_errors = []
     if share:
-        # Gradio hides why a share link failed; record the real reason and retry once
-        import time as _t
-        import gradio.networking as _gnet
-        _orig_tunnel = _gnet.setup_tunnel
-
-        def _tunnel(*a, **k):
-            for attempt in (1, 2):
-                try:
-                    return _orig_tunnel(*a, **k)
-                except Exception as e:
-                    share_errors.append(e)
-                    if attempt == 1:
-                        print("Share link attempt 1 failed, retrying...")
-                        _t.sleep(3)
-            raise share_errors[-1]
-        _gnet.setup_tunnel = _tunnel
+        RM.retry_share_tunnel(share_errors)
     ui = build().queue()
     ui.launch(inbrowser=True, allowed_paths=[OUTPUT_DIR, ASSETS_DIR], theme=THEME, css=CSS,
               prevent_thread_lock=True, **kw)

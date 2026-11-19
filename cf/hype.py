@@ -3,15 +3,14 @@
 Gameplay highlights are often loud rather than wordy, so these timestamps are
 given to the LLM alongside the transcript and used to place impact SFX.
 """
-import wave
-
 import numpy as np
+
+from .audio import read_wav
 
 
 def loud_moments(wav_path, window=0.5, top=40, min_gap=8.0):
-    with wave.open(wav_path, "rb") as w:
-        sr = w.getframerate()
-        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+    samples, sr, _ = read_wav(wav_path)
+    data = samples.astype(np.float32)
     if data.size == 0:
         return []
     hop = int(sr * window)
