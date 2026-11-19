@@ -3,8 +3,12 @@
   python cli.py "D:\\Videos\\GTA6"                 # every video in the folder
   python cli.py stream1.mp4 https://youtu.be/xyz --clips 10
 
-Uses the settings saved from the app (API key, layout, logo, campaign rules, etc.);
-flags override them:  --logo sponsor.png  --rules rules.pdf  (--logo none / --rules none to turn off)
+Uses the preferences saved from the app (API key, layout, style, clip lengths...); flags
+override them. A sponsor logo and campaign rules are per run, so they only come from flags:
+  --logo sponsor.png  --rules rules.pdf
+Facecam layout: give both boxes as x,y,width,height fractions of the frame (0-1), e.g.
+  --layout facecam --cam 0.78,0.70,0.20,0.27 --game 0.2,0,0.6,1 --cam-size 0.4
+(shapes are corrected automatically; drawing them in the app is easier).
 """
 import argparse
 import glob
@@ -12,6 +16,7 @@ import os
 import sys
 
 from cf import publish as PUB
+from cf import storage
 from cf.brand import store_logo
 from cf.pipeline import process
 from cf.rules import read_rules_file
@@ -26,13 +31,17 @@ def main():
     ap.add_argument("--min", type=int, dest="min_len")
     ap.add_argument("--max", type=int, dest="max_len")
     ap.add_argument("--model")
-    ap.add_argument("--layout", choices=["blur", "crop"])
+    ap.add_argument("--layout", choices=["blur", "crop", "facecam", "split"])
+    ap.add_argument("--cam", help="facecam box x,y,w,h (0-1 of the frame)")
+    ap.add_argument("--game", help="gameplay box x,y,w,h (0-1 of the frame)")
+    ap.add_argument("--cam-size", dest="cam_size", type=float, default=0.4,
+                    help="facecam share of the clip's height, 0.25-0.55 (default 0.4)")
     ap.add_argument("--hint", dest="content_hint")
     ap.add_argument("--creator")
     ap.add_argument("--formats", help="comma list, e.g. cold_open,replay,top")
-    ap.add_argument("--logo", help="sponsor logo image (replaces the saved one); 'none' = no logo")
+    ap.add_argument("--logo", help="sponsor logo image for this run")
     ap.add_argument("--logo-anim", dest="logo_anim", choices=["float", "pulse", "none"])
-    ap.add_argument("--rules", help="campaign rules file (.txt .md .pdf .docx); 'none' = no rules")
+    ap.add_argument("--rules", help="campaign rules file for this run (.txt .md .pdf .docx)")
     ap.add_argument("--motion", choices=["on", "off"], help="HyperFrames motion graphics")
     ap.add_argument("--from", dest="range_start", help="use footage from this time only, e.g. 2:56:29")
     ap.add_argument("--to", dest="range_end", help="use footage up to this time (default: end of video)")
@@ -57,7 +66,13 @@ def main():
     if a.clips:
         cfg["n_clips"] = a.clips
     if a.logo:
-        cfg["logo_path"] = "" if a.logo.lower() == "none" else store_logo(a.logo)
+        cfg["logo_path"] = store_logo(a.logo)
+    if a.cam or a.game:
+        try:
+            box = lambda t: [float(v) for v in t.split(",")][:4]   # noqa: E731
+            cfg["facecam"] = {"cam": box(a.cam), "game": box(a.game), "split": a.cam_size}
+        except (AttributeError, ValueError):
+            sys.exit("--cam and --game both need x,y,w,h fractions, e.g. --cam 0.78,0.7,0.2,0.27")
     if a.logo_anim:
         cfg["logo_anim"] = a.logo_anim
     cfg["range_start"], cfg["range_end"] = a.range_start or "", a.range_end or ""
@@ -76,9 +91,8 @@ def main():
     if a.motion:
         cfg["motion_on"] = a.motion == "on"
     if a.rules:
-        cfg["rules_text"] = "" if a.rules.lower() == "none" else read_rules_file(a.rules)
-    if cfg.get("rules_text"):
-        print("Campaign rules are ON (saved in the app or --rules). Use --rules none to turn off.")
+        cfg["rules_text"] = read_rules_file(a.rules)
+        print("Campaign rules are ON for this run.")
 
     if a.live:
         import time
@@ -114,6 +128,7 @@ def main():
             failed.append(src)
     print(f"\nFinished {len(jobs) - len(failed)}/{len(jobs)} videos." +
           (f" Failed: {failed}" if failed else ""))
+    storage.clean(cfg.get("keep_days", 6), log=print)
 
 
 if __name__ == "__main__":

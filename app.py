@@ -1,8 +1,19 @@
-"""ClipForge - local web app. Run:  python app.py  (opens http://127.0.0.1:7860)"""
+"""ClipForge - local web app. Run:  python app.py  (opens http://127.0.0.1:7860)
+
+Everything for a run is on one Clip page, top to bottom:
+  Video | Live switch -> 1 source -> 2 layout (draw the facecam/gameplay boxes) -> 3 clips
+  -> Style / Campaign (optional, folded) -> Start / Stop / New session -> progress -> results.
+Publish (YouTube + Telegram) and Settings (keys, models, storage, phone access) are separate
+pages because they are set once.
+
+Runs happen in the background (Run here, live.LiveSession for streams); the page polls them
+every second, so Stop works, and reloading the page reattaches to a run in progress.
+"""
 import os
-import queue
 import threading
+import time
 import traceback
+from collections import deque
 
 import gradio as gr
 
@@ -19,10 +30,12 @@ if os.name == "nt":
             pass
     _pe._ProactorBasePipeTransport._call_connection_lost = _quiet_lost
 
+from cf import frames as FR
 from cf import gameplay as GP
 from cf import live as LIVE
 from cf import publish as PUB
 from cf import remote as RM
+from cf import storage
 from cf.brand import ANIMATIONS, ASSETS_DIR, remove_logo, store_logo
 from cf.captions import COLORS
 from cf.cloud_stt import MODELS as CLOUD_MODELS
@@ -31,35 +44,113 @@ from cf.memes import library as meme_library
 from cf.motion import ELEMENTS as MOTION_ELEMENTS, status as motion_check
 from cf.pipeline import process
 from cf.rules import read_rules_file
-from cf.settings import DEFAULTS, load_settings, save_settings, update_settings
-from cf.tools import OUTPUT_DIR, fmt_ts
+from cf.settings import load_settings, save_settings, update_settings
+from cf.tools import OUTPUT_DIR, Cancelled, fmt_ts, stop_scope
 from cf.transcribe import LOCAL_MODELS
+from ui import boxpicker as BP
+from ui.theme import CSS, THEME
 
 STT_CHOICES = ([("Cloud · Whisper Large V3 (best)", f"cloud:{CLOUD_MODELS[0]}"),
                 ("Cloud · Whisper V3 Turbo (cheaper)", f"cloud:{CLOUD_MODELS[1]}")]
                + [(f"Local: {m}", m) for m in LOCAL_MODELS])
 HIGHLIGHTS = ["auto"] + list(COLORS)
+LAYOUTS = [("🎥  Facecam + gameplay", "facecam"), ("🖼  Full frame", "blur"),
+           ("⬛  Fill screen", "crop"), ("🎮  Split with gameplay", "split")]
+LAYOUT_NOTES = {
+    "facecam": "For streams: the streamer's camera on top, the game below, captions on the line "
+               "between them. Load a frame and draw the two boxes.",
+    "blur": "The whole video, nothing cut off, on a blurred copy of itself. Zoom above 1.0 crops the sides.",
+    "crop": "Fills the vertical screen by cutting off the sides. Fine for videos already centred on the action.",
+    "split": "The video on top, a muted gameplay video (Minecraft parkour, Subway Surfers...) underneath. "
+             "Gameplay comes from the gameplay folder.",
+}
+_TEXT = lambda v: (v or "").strip()   # noqa: E731
 
-# Saved form fields: settings key -> how to read the widget's value.
-_TEXT = lambda v: (v or "").strip()
-SAVED = {
-    "content_hint": _TEXT, "creator": _TEXT, "formats": lambda v: list(v or []) or ["standard"],
-    "top_n_on": bool, "top_n": int, "n_clips": int, "min_len": int, "max_len": int,
-    "split_on": bool, "split_game": lambda v: v or GP.ANY,
-    "motion_on": bool, "motion_elements": lambda v: list(v or []),
-    "meme_on": bool, "meme_gain": float, "sfx_on": bool, "sfx_gain": float,
-    "highlight": str, "words_per_line": int, "cta_on": bool, "progress_on": bool,
-    "punch_on": bool, "layout": str, "zoom": float,
-    "logo_anim": str, "logo_size": float, "rules_text": lambda v: v or "",
-    "api_key": _TEXT, "model": lambda v: (v or "auto").strip() or "auto", "allow_free": bool,
-    "whisper_model": str, "fallback_model": str, "language": _TEXT,
-    "yt_on": bool, "yt_mode": str, "yt_interval": int, "yt_first_delay": int, "yt_category": str,
-    "telegram_token": _TEXT, "telegram_chat": _TEXT,
+# Preferences shown on the pages: settings key -> how to read the widget. Saved on every Start.
+PREFS = {
+    "mode": str, "layout": str, "zoom": float, "split_game": lambda v: v or GP.ANY,
+    "n_clips": int, "min_len": int, "max_len": int, "top_n_on": bool, "top_n": int,
+    "formats": lambda v: list(v or []) or ["standard"], "highlight": str, "words_per_line": int,
+    "cta_on": bool, "progress_on": bool, "punch_on": bool, "sfx_on": bool, "sfx_gain": float,
+    "meme_on": bool, "meme_gain": float, "motion_on": bool, "motion_elements": lambda v: list(v or []),
+    "logo_anim": str, "logo_size": float,
     "live_interval": int, "live_min_score": int, "live_max_clips": int,
     "live_upload": bool, "live_keep": bool, "live_chat_on": bool,
+    "api_key": _TEXT, "model": lambda v: (v or "auto").strip() or "auto", "allow_free": bool,
+    "whisper_model": str, "fallback_model": str, "language": _TEXT, "keep_days": int,
+    "yt_on": bool, "yt_mode": str, "yt_interval": int, "yt_first_delay": int, "yt_category": str,
+    "telegram_token": _TEXT, "telegram_chat": _TEXT,
 }
-KEEP_ON_RESET = ("api_key", "telegram_token", "telegram_chat", "share_on", "share_user", "share_hash")
-EMPTY_RESULTS = ("", None, None, "")
+# What belongs to this run only (never saved; cleared by New session).
+RUN_FIELDS = ("path_or_url", "upload", "range_start", "range_end", "live_url", "content_hint",
+              "creator", "rules_text", "logo_state")
+YT_KEYS = ["yt_mode", "yt_interval", "yt_first_delay", "yt_category", "telegram_token", "telegram_chat"]
+
+
+# ---------------------------------------------------------------- background run (Video mode)
+class Run:
+    """One Video-mode job: process() + YouTube upload, in a thread, stoppable."""
+
+    def __init__(self, source, cfg):
+        self.source, self.cfg = source, cfg
+        self.lines = deque(maxlen=800)
+        self.result, self.error, self.state = None, "", "running"
+        self.started, self.ended = time.time(), None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def log(self, msg):
+        for part in str(msg).splitlines() or [""]:
+            self.lines.append(f"{time.strftime('%H:%M:%S')}  {part}")
+
+    @property
+    def running(self):
+        return self._thread.is_alive()
+
+    def stop(self):
+        if self.running and not self._stop.is_set():
+            self.log("Stopping...")
+            self.state = "stopping"
+        self._stop.set()
+
+    def _run(self):
+        with stop_scope(self._stop):
+            try:
+                self.result = process(self.source, self.cfg, log=self.log)
+                if self.cfg.get("yt_on"):
+                    try:
+                        PUB.after_run(self.result, self.cfg, log=self.log)
+                    except Exception as e:   # clips are made; an upload problem must not hide them
+                        self.log(f"YouTube upload problem: {e}")
+                self.state = "done"
+            except Cancelled:
+                self.log("Stopped.")
+                self.state = "stopped"
+            except Exception as e:
+                self.error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+                self.log(f"ERROR: {e}")
+                print(traceback.format_exc())
+                self.state = "error"
+            finally:
+                self.ended = time.time()
+        try:
+            storage.clean(self.cfg.get("keep_days", 6), live_running=_live_running(), log=self.log)
+        except Exception as e:
+            print(f"storage clean failed: {e}")
+
+
+RUN = {"job": None, "kind": None}       # the run the Clip page shows: kind "video" or "live"
+
+
+def _live_running():
+    s = LIVE.current()
+    return bool(s and s.running)
+
+
+def _busy():
+    job = RUN["job"]
+    return bool(job and job.running) or _live_running()
 
 
 # ---------------------------------------------------------------- status texts
@@ -76,131 +167,17 @@ def meme_status():
     if not lib:
         return ("⚠️ No sounds yet. Put mp3/wav files in the **sounds** folder inside ClipForge "
                 "and describe when to use them in sounds\\sounds.txt.")
-    return (f"✅ {len(lib)} sounds: " + ", ".join(sorted(lib)) +
-            ". The AI adds 0-2 per clip, only where one fits.")
+    return f"✅ {len(lib)} sounds: " + ", ".join(sorted(lib)) + ". The AI adds 0-2 per clip, only where one fits."
 
 
 def split_status():
-    lib = GP.library()
-    if not lib:
+    if not GP.library():
         return "⚠️ " + GP.describe()
-    return f"✅ Gameplay library: {GP.describe()}. Each clip gets a different video, muted."
+    return f"Gameplay library: {GP.describe()}. Each clip gets a different video, muted."
 
 
 def game_choices():
     return [("Any game (mix)", GP.ANY)] + [(GP.nice(g), g) for g in sorted(GP.library())]
-
-
-# ---------------------------------------------------------------- run
-def collect_cfg(val):
-    """Every setting on every page -> one cfg dict, saved to settings.json."""
-    cfg = {k: conv(val[k]) for k, conv in SAVED.items()}
-    cfg["logo_path"] = val["logo_state"] or ""
-    cfg = {**load_settings(), **cfg}  # keep keys the form doesn't show (settings version etc.)
-    cfg.pop("range_start", None), cfg.pop("range_end", None)
-    save_settings(cfg)
-    return cfg
-
-
-def make_run(w):
-    """Builds the click handler; `w` maps names to widgets so inputs arrive by name, not position."""
-    def run(data):
-        val = {k: data[c] for k, c in w.items() if c in data}
-        source = str((val["path_or_url"] or "").strip().strip('"') or (val["upload"] or ""))
-        if not source:
-            yield "Pick a video file or paste a path / URL.", None, None, ""
-            return
-        cfg = collect_cfg(val)
-        # From/To belong to this one video, so they are used for this run but never saved
-        cfg["range_start"], cfg["range_end"] = _TEXT(val["range_start"]), _TEXT(val["range_end"])
-
-        q, lines, box = queue.Queue(), [], {}
-
-        def worker():
-            try:
-                box["res"] = process(source, cfg, log=q.put)
-                if cfg.get("yt_on"):
-                    try:
-                        PUB.after_run(box["res"], cfg, log=q.put)
-                    except Exception as e:   # clips are made; an upload problem must not hide them
-                        q.put(f"YouTube upload problem: {e}")
-            except Exception as e:
-                q.put(f"ERROR: {e}")
-                box["err"] = traceback.format_exc()
-            finally:
-                q.put(None)
-
-        threading.Thread(target=worker, daemon=True).start()
-        while True:
-            msg = q.get()
-            if msg is None:
-                break
-            lines.append(str(msg))
-            yield "\n".join(lines[-200:]), None, None, ""
-        res = box.get("res")
-        if not res:
-            yield "\n".join(lines) + "\n\n" + box.get("err", ""), None, None, ""
-            return
-        n = len(res["clips"])
-        md = [f"### {n} clip{'' if n == 1 else 's'} saved\n\n`{res['out_dir']}`\n\n---"]
-        for i, c in enumerate(res["clips"], 1):
-            kws = c.get("keywords") or []
-            md.append(f"**{i}. {c['title']}**  \n`{c['format']}` · {c['length']:.0f}s"
-                      + (f" · score {c['score']}" if c.get("score") is not None else "")
-                      + (f" · gameplay: {c['gameplay']}" if c.get("gameplay") else "")
-                      + f"\n\n{c['caption']}\n\n_hook:_ {c['hook']}\n\n"
-                      f"_keywords ({len(kws)}):_ {', '.join(kws) or 'none'}\n\n---")
-        files = [c["file"] for c in res["clips"]]
-        yield "\n".join(lines), files, files[0] if files else None, "\n\n".join(md)
-    return run
-
-
-# ---------------------------------------------------------------- small handlers
-def on_logo(path):
-    if not path:
-        return gr.update(), gr.update(), "No file."
-    try:
-        stored = store_logo(path)
-    except Exception as e:
-        return gr.update(), gr.update(), f"Couldn't read that image: {e}"
-    update_settings(logo_path=stored)
-    return stored, stored, "Logo saved. It appears on every clip, under the captions."
-
-
-def on_remove_logo():
-    remove_logo()
-    update_settings(logo_path="")
-    return None, "", "Logo removed."
-
-
-def on_rules_file(path):
-    if not path:
-        return gr.update(), ""
-    try:
-        text = read_rules_file(path)
-    except Exception as e:
-        return gr.update(), f"Couldn't read that file: {e}"
-    update_settings(rules_text=text)
-    return text, f"Loaded {len(text):,} characters. Check the text below; you can edit it."
-
-
-def on_motion(on):
-    update_settings(motion_on=bool(on))
-    return gr.update(visible=on), gr.update(value=motion_status() if on else "", visible=on)
-
-
-def on_meme(on):
-    update_settings(meme_on=bool(on))
-    return gr.update(visible=on), gr.update(value=meme_status() if on else "", visible=on)
-
-
-def on_split(on):
-    update_settings(split_on=bool(on))
-    choices = game_choices()
-    keep = load_settings().get("split_game") or GP.ANY
-    keep = keep if keep in [v for _, v in choices] else GP.ANY
-    return (gr.update(visible=on, choices=choices, value=keep),
-            gr.update(value=split_status() if on else "", visible=on))
 
 
 def yt_status():
@@ -214,10 +191,255 @@ def yt_status():
         return f"⚠️ {e}"
 
 
+def share_status():
+    s = load_settings()
+    if not s.get("share_on"):
+        return "Off. The app only works on this PC."
+    if not s.get("share_hash"):
+        return "⚠️ On, but no password yet: set one below, then restart ClipForge."
+    return (f"✅ On for user **{s.get('share_user') or 'klipr'}**. After a restart, the phone link is "
+            "printed in the ClipForge window and sent to your Telegram. It changes every restart.")
+
+
+def storage_status():
+    s = load_settings()
+    return (f"ClipForge uses **{storage.describe()}**. Clips and temporary files older than "
+            f"**{s.get('keep_days', 6)} days** are deleted automatically (at startup and after every run).")
+
+
+# ---------------------------------------------------------------- the run
+def _source(val):
+    if val["mode"] == "live":
+        return _TEXT(val["live_url"])
+    return str(_TEXT(val["path_or_url"]).strip('"') or (val["upload"] or ""))
+
+
+def collect_cfg(val):
+    """Every setting on every page -> one cfg dict. Preferences are saved, run inputs are not."""
+    cfg = {**load_settings(), **{k: conv(val[k]) for k, conv in PREFS.items() if k in val}}
+    save_settings(cfg)                         # drops RUN_KEYS by itself
+    cfg.update({"content_hint": _TEXT(val["content_hint"]), "creator": _TEXT(val["creator"]),
+                "rules_text": val["rules_text"] or "", "logo_path": val["logo_state"] or "",
+                "range_start": _TEXT(val["range_start"]) if val["mode"] == "video" else "",
+                "range_end": _TEXT(val["range_end"]) if val["mode"] == "video" else ""})
+    cfg["split_on"] = cfg["layout"] == "split"
+    _, boxes = BP.read(val["picker"])
+    cfg["facecam"] = boxes if cfg["layout"] == "facecam" else None
+    return cfg
+
+
+def make_start(w):
+    def start(data):
+        val = {k: data[c] for k, c in w.items() if c in data}
+        try:
+            if _busy():
+                raise gr.Error("Something is already running. Stop it first.")
+            source = _source(val)
+            if not source:
+                raise gr.Error("Add a video first: paste a link or a file path, or drop a file."
+                               if val["mode"] == "video" else "Paste the live stream's link first.")
+            cfg = collect_cfg(val)
+            if not (cfg.get("api_key") or "").strip():
+                raise gr.Error("Add your OpenRouter API key on the Settings page first.")
+            if cfg["layout"] == "facecam" and not cfg["facecam"]:
+                raise gr.Error("Facecam layout: press Load frame and draw the facecam and gameplay boxes first.")
+            if val["mode"] == "live":
+                RUN["job"], RUN["kind"] = LIVE.start(source, cfg), "live"
+            else:
+                RUN["job"], RUN["kind"] = Run(source, cfg), "video"
+        except gr.Error:
+            raise
+        except Exception as e:
+            raise gr.Error(str(e)) from None
+        return view("")
+    return start
+
+
+def stop_run():
+    job = RUN["job"]
+    if job and job.running:
+        job.stop()
+    return view("")
+
+
+def _clip_md(c, live=False):
+    kws = c.get("keywords") or []
+    head = f"**{c['title']}**  \n`{c['format']}` · {c['length']:.0f}s"
+    if c.get("score") is not None:
+        head += f" · score {c['score']}"
+    if live:
+        head += f" · {c.get('stream_time', '?')} into the stream"
+    if c.get("gameplay"):
+        head += f" · gameplay: {c['gameplay']}"
+    body = f"\n\n{c['caption']}\n\n_hook:_ {c.get('hook', '')}"
+    if c.get("trigger") or c.get("reason"):
+        body += f"\n\n_why:_ {(c['trigger'] + ' - ') if c.get('trigger') else ''}{c.get('reason', '')}"
+    if not live:
+        body += f"\n\n_keywords ({len(kws)}):_ {', '.join(kws) or 'none'}"
+    return head + body
+
+
+def _status_line(job, kind):
+    if not job:
+        return "Ready. Add a video, choose a layout and press **Start**."
+    if kind == "live":
+        st = job.status()
+        head = {"starting": "⏳ Starting...", "waiting": "⏳ Waiting for the stream to go live",
+                "recording": "🔴 **Watching live**", "stopping": "⏳ Stopping...",
+                "stopped": "⏹ Stopped", "error": "⚠️ Stopped with an error"}.get(st["state"], st["state"])
+        if st["error"]:
+            return f"{head}: {st['error'][:200]}"
+        bits = [f"{fmt_ts(st['elapsed'], hours=True)} running", f"{st['checks']} checks",
+                f"**{st['clips']} clips**", f"{st['uploaded']} uploaded"]
+        if st["next_in"] is not None:
+            bits.append(f"next check in {int(st['next_in']) // 60}:{int(st['next_in']) % 60:02d}")
+        if st["chat"] is not None:
+            bits.append(f"{st['chat']:,} chat msgs")
+        return head + " · " + " · ".join(bits)
+    took = fmt_ts((job.ended or time.time()) - job.started, hours=True)
+    if job.state in ("running", "stopping"):
+        last = job.lines[-1].split("  ", 1)[-1] if job.lines else "Starting..."
+        return f"{'⏳ Stopping' if job.state == 'stopping' else '⏳ Working'} · {took} · {last[:110]}"
+    if job.state == "done":
+        r = job.result or {}
+        cost = f" · est. cost ${r.get('est_cost_usd', 0):.3f}" if r.get("est_cost_usd") else ""
+        return f"✅ **Done: {len(r.get('clips', []))} clips** in {took}{cost}"
+    if job.state == "stopped":
+        return f"⏹ Stopped after {took}."
+    return f"⚠️ {job.error[:220]}"
+
+
+def view(seen):
+    """Everything the Clip page shows about the current run; heavy parts only when changed.
+    Returns status, log, files, preview video, clip list, seen-key, timer, start, stop, new,
+    progress card, results card."""
+    job, kind = RUN["job"], RUN["kind"]
+    running = bool(job and job.running)
+    status = _status_line(job, kind)
+    key = ""
+    if job:
+        key = f"{kind}|{id(job)}|{len(job.lines)}|{job.lines[-1] if job.lines else ''}|{running}"
+    log = files = video = info = progress_card = results_card = gr.update()
+    if key != seen:
+        log = "\n".join(job.lines) if job else ""
+        clips = []
+        out_dir = ""
+        if job and kind == "live":
+            clips, out_dir = list(job.clips), job.out_dir
+        elif job and job.result:
+            clips, out_dir = job.result.get("clips", []), job.result.get("out_dir", "")
+        paths = [c["file"] for c in clips if os.path.exists(c["file"])]
+        files = paths or None
+        video = paths[0] if paths else None
+        info = ""
+        if clips:
+            info = f"`{out_dir}`\n\n---\n\n" + "\n\n---\n\n".join(
+                _clip_md(c, kind == "live") for c in (reversed(clips) if kind == "live" else clips))
+        progress_card = gr.update(visible=job is not None)
+        results_card = gr.update(visible=bool(clips))
+    return (status, log, files, video, info, key, gr.Timer(active=running),
+            gr.update(interactive=not running), gr.update(interactive=running),
+            gr.update(interactive=not running), progress_card, results_card)
+
+
+# ---------------------------------------------------------------- frame + boxes
+def _frame_source(mode, path, upload, live_url):
+    if mode == "live":
+        return _TEXT(live_url)
+    return str(_TEXT(path).strip('"') or (upload or ""))
+
+
+def _file_url(path):
+    return "/gradio_api/file=" + path.replace("\\", "/")
+
+
+def load_frame(mode, path, upload, live_url, frame, picker, layout, zoom, logo, logo_size, next_one=False):
+    source = _frame_source(mode, path, upload, live_url)
+    attempt = (frame or {}).get("attempt", -1) + 1 if next_one and (frame or {}).get("source") == source else 0
+    try:
+        fr = FR.grab(source, attempt=attempt, live=mode == "live")
+    except Exception as e:
+        return gr.update(), frame, gr.update(), f"⚠️ {e}"
+    old, boxes = BP.read(picker)
+    if not boxes or not old or (old.get("w"), old.get("h")) != (fr["width"], fr["height"]):
+        boxes = FR.default_boxes(fr["width"], fr["height"], (boxes or {}).get("split", 0.4))
+    frame = {**fr, "attempt": attempt, "source": source}
+    when = f" at {fmt_ts(fr['at'])}" if fr.get("at") is not None else " (live now)"
+    msg = (f"Frame{when} from **{fr['title'][:60] or 'your video'}**. "
+           + ("Drag the boxes over the facecam and the gameplay." if layout == "facecam" else ""))
+    return (BP.value(_file_url(fr["path"]), fr["width"], fr["height"], boxes), frame,
+            _preview(frame, layout, boxes, zoom, logo, logo_size), msg)
+
+
+def _preview(frame, layout, boxes, zoom, logo, logo_size):
+    """Update for the preview image: shown only when there is a preview."""
+    path = None
+    if frame and frame.get("path") and os.path.exists(frame["path"]) and (layout != "facecam" or boxes):
+        try:
+            path = FR.preview(frame["path"], layout, boxes, zoom=zoom, logo_path=logo, logo_size=logo_size,
+                              split_bottom=layout == "split")
+        except Exception as e:
+            print(f"preview failed: {e}")
+    return gr.update(value=path, visible=path is not None)
+
+
+def refresh_preview(frame, picker, layout, zoom, logo, logo_size):
+    _, boxes = BP.read(picker)
+    return _preview(frame, layout, boxes, zoom, logo, logo_size)
+
+
+def on_layout(layout, frame, picker, zoom, logo, logo_size):
+    _, boxes = BP.read(picker)
+    return (gr.update(visible=layout == "facecam"), gr.update(visible=layout == "blur"),
+            gr.update(visible=layout == "split", choices=game_choices()),
+            gr.update(value=split_status() if layout == "split" else "", visible=layout == "split"),
+            LAYOUT_NOTES[layout], _preview(frame, layout, boxes, zoom, logo, logo_size))
+
+
+def on_mode(mode):
+    video, live = mode == "video", mode == "live"
+    return (gr.update(visible=video), gr.update(visible=live), gr.update(visible=video),
+            gr.update(visible=live),
+            gr.update(value="▶  Start watching" if live else "▶  Start clipping"))
+
+
+# ---------------------------------------------------------------- small handlers
+def on_logo(path, frame, picker, layout, zoom, logo_size):
+    if not path:
+        return gr.update(), gr.update(), "No file.", gr.update()
+    try:
+        stored = store_logo(path)
+    except Exception as e:
+        return gr.update(), gr.update(), f"Couldn't read that image: {e}", gr.update()
+    return stored, stored, "Logo added for this run.", refresh_preview(frame, picker, layout, zoom, stored, logo_size)
+
+
+def on_remove_logo(frame, picker, layout, zoom, logo_size):
+    remove_logo()
+    return None, "", "Logo removed.", refresh_preview(frame, picker, layout, zoom, "", logo_size)
+
+
+def on_rules_file(path):
+    if not path:
+        return gr.update(), ""
+    try:
+        text = read_rules_file(path)
+    except Exception as e:
+        return gr.update(), f"Couldn't read that file: {e}"
+    return text, f"Loaded {len(text):,} characters. Check the text below; you can edit it."
+
+
+def on_motion(on):
+    return gr.update(visible=on), gr.update(value=motion_status() if on else "", visible=on)
+
+
+def on_meme(on):
+    return gr.update(visible=on), gr.update(value=meme_status() if on else "", visible=on)
+
+
 def on_connect():
     try:
-        title = PUB.connect()
-        return f"✅ Connected to **{title}**."
+        return f"✅ Connected to **{PUB.connect()}**."
     except Exception as e:
         return f"⚠️ {e}"
 
@@ -231,19 +453,18 @@ def on_test_telegram(token, chat):
     ok, err = PUB.telegram({"telegram_token": token, "telegram_chat": chat},
                            "👋 ClipForge test message: notifications are working.")
     if ok:
-        update_settings(telegram_token=(token or "").strip(), telegram_chat=(chat or "").strip())
+        update_settings(telegram_token=_TEXT(token), telegram_chat=_TEXT(chat))
         return "✅ Sent. Check Telegram. (Bot saved.)"
     return f"⚠️ Telegram said: {err}"
 
 
 def queue_view():
     items = PUB.review_list()
-    return (PUB.summary(), gr.update(choices=items, value=[]),
-            gr.update(visible=bool(items)))
+    return PUB.summary(), gr.update(choices=items, value=[]), gr.update(visible=bool(items))
 
 
 def on_upload_queue(*vals):
-    cfg = {**load_settings(), **{k: SAVED[k](v) for k, v in zip(YT_KEYS, vals)}}
+    cfg = {**load_settings(), **{k: PREFS[k](v) for k, v in zip(YT_KEYS, vals)}}
     lines = []
     try:
         PUB.upload_queue(cfg, log=lines.append)
@@ -261,18 +482,8 @@ def on_publish(ids):
     return f"Published {n} of {len(ids)}." + ("\n" + "\n".join(lines) if lines else ""), *queue_view()
 
 
-def share_status():
-    s = load_settings()
-    if not s.get("share_on"):
-        return "Off. The app only works on this PC."
-    if not s.get("share_hash"):
-        return "⚠️ On, but no password yet: set one below, then restart ClipForge."
-    return (f"✅ On for user **{s.get('share_user') or 'klipr'}**. After a restart, the phone link is "
-            "printed in the ClipForge window and sent to your Telegram. It changes every restart.")
-
-
 def on_share(on, user, pw):
-    user = (user or "").strip()
+    user = _TEXT(user)
     if on and not user:
         return "⚠️ Enter a username.", share_status()
     if pw and len(pw) < 8:
@@ -287,112 +498,41 @@ def on_share(on, user, pw):
             + (" Password changed." if pw else "")), share_status()
 
 
-YT_KEYS = ["yt_mode", "yt_interval", "yt_first_delay", "yt_category", "telegram_token", "telegram_chat"]
+def save_prefs(*vals, keys=()):
+    update_settings(**{k: PREFS[k](v) for k, v in zip(keys, vals)})
 
 
-def make_reset(w, order):
-    """Reset the form to the defaults (API key kept), clear the logo, rules and last results.
-    Cached transcripts/downloads and finished clips are kept."""
-    def reset():
-        s = load_settings()
-        fresh = {**DEFAULTS, **{k: s.get(k, "") for k in KEEP_ON_RESET},
-                 "settings_version": s.get("settings_version", 2)}
-        fresh.pop("range_start", None), fresh.pop("range_end", None)
-        save_settings(fresh)
+def on_clean(days):
+    update_settings(keep_days=int(days))
+    freed = storage.clean(int(days), live_running=_live_running())
+    return f"Freed {freed / 1e6:.0f} MB." if freed else "Nothing old enough to delete.", storage_status()
+
+
+def make_new_session(w, order):
+    """New session: clear everything that belongs to the last run - inputs, frame and boxes,
+    logo, rules, log, results - and forget a finished live session. Preferences stay."""
+    def new_session():
+        if _busy():
+            gr.Warning("A run is still going: press Stop first.")
+            return [gr.update() for _ in order] + list(view(""))
+        RUN["job"], RUN["kind"] = None, None
+        LIVE.forget()
         try:
             remove_logo()
         except Exception:
             pass
-        values = {
-            **{k: fresh[k] for k in SAVED},
-            "upload": None, "path_or_url": "", "range_start": "", "range_end": "", "live_url": "",
-            "logo_state": "", "logo_preview": None, "logo_file": None, "logo_msg": "",
-            "rules_file": None, "rules_msg": "",
-            "log": "", "files": None, "preview": None, "info": "",
-            "motion_msg": "", "meme_msg": "", "split_msg": "",
-        }
-        ups = []
-        for k in order:
-            if k == "motion_elements":
-                ups.append(gr.update(value=values[k], visible=False))
-            elif k == "meme_gain":
-                ups.append(gr.update(value=values[k], visible=False))
-            elif k == "split_game":
-                ups.append(gr.update(value=GP.ANY, choices=game_choices(), visible=False))
-            elif k in ("motion_msg", "meme_msg", "split_msg"):
-                ups.append(gr.update(value="", visible=False))
-            else:
-                ups.append(values[k])
-        ups.append("Everything is back to the defaults. Your API key, Telegram bot, YouTube "
-                   "connection, phone access and finished clips were kept.")
-        gr.Info("Settings reset to the defaults.")
-        return ups
-    return reset
+        blank = {"path_or_url": "", "upload": None, "range_start": "", "range_end": "", "live_url": "",
+                 "content_hint": "", "creator": "", "rules_text": "", "rules_file": None, "rules_msg": "",
+                 "logo_state": "", "logo_preview": None, "logo_file": None, "logo_msg": "",
+                 "picker": "", "frame": None, "layout_preview": gr.update(value=None, visible=False),
+                 "frame_msg": ""}
+        gr.Info("New session: everything from the last run is cleared.")
+        return [blank[k] if k in blank else gr.update() for k in order] + list(view("refresh"))
+    return new_session
 
 
-# ---------------------------------------------------------------- live monitor
-
-def live_status_text(sess):
-    if not sess:
-        return "**Not watching anything.** Paste a live stream link and press Start."
-    st = sess.status()
-    head = {"starting": "⏳ **Starting...**", "waiting": "⏳ **Waiting for the stream to go live**",
-            "recording": "🔴 **Watching live**", "stopping": "⏳ **Stopping: finishing the last check**",
-            "stopped": "⏹ **Stopped**", "error": "⚠️ **Stopped**"}.get(st["state"], st["state"])
-    if st["title"]:
-        head += f" · {st['title'][:80]}"
-    if st["error"]:
-        return head + f"\n\n{st['error']}"
-    bits = [f"running {fmt_ts(st['elapsed'], hours=True)}", f"{fmt_ts(st['recorded'], hours=True)} recorded",
-            f"{st['checks']} check{'' if st['checks'] == 1 else 's'}",
-            f"**{st['clips']} clip{'' if st['clips'] == 1 else 's'}**", f"{st['uploaded']} uploaded"]
-    if st["next_in"] is not None:
-        bits.append(f"next check in {int(st['next_in']) // 60}:{int(st['next_in']) % 60:02d}")
-    if st["chat"] is not None:
-        bits.append(f"{st['chat']:,} chat messages read")
-    if st["state"] in ("recording", "stopping"):
-        bits.append(f"{st['disk_mb']:.0f} MB on disk")
-    return head + "\n\n" + " · ".join(bits)
-
-
-def live_view(seen):
-    """Everything the Live page shows; heavy parts only change when something happened."""
-    sess = LIVE.current()
-    running = bool(sess and sess.running)
-    key = f"{len(sess.clips)}|{len(sess.lines)}|{sess.lines[-1] if sess.lines else ''}" if sess else ""
-    log = files = info = gr.update()
-    if key != seen:
-        log = "\n".join(sess.lines) if sess else ""
-        clips = list(sess.clips) if sess else []
-        files = [c["file"] for c in clips if os.path.exists(c["file"])] or None
-        info = "\n\n".join(
-            f"**{c['title']}**  \n{c.get('stream_time', '?')} into the stream · {c['length']:.0f}s"
-            + (f" · score {c['score']}" if c.get("score") is not None else "")
-            for c in reversed(clips))
-        if clips:
-            info = f"`{sess.out_dir}`\n\n" + info
-    return (live_status_text(sess), log, files, info, key, gr.Timer(active=running),
-            gr.update(interactive=not running), gr.update(interactive=running))
-
-
-def make_live_start(w):
-    def live_start(data):
-        val = {k: data[c] for k, c in w.items() if c in data}
-        try:
-            LIVE.start(val["live_url"], collect_cfg(val))
-        except Exception as e:
-            gr.Warning(str(e))
-        return live_view("")
-    return live_start
-
-
-def live_stop():
-    LIVE.stop()
-    return live_view("")
-
-
-PAGES = [("create", "🎬", "Create"), ("live", "🔴", "Live"), ("style", "🎨", "Style"),
-         ("campaign", "📣", "Campaign"), ("publish", "📤", "Publish"), ("settings", "⚙️", "Settings")]
+# ---------------------------------------------------------------- page building blocks
+PAGES = [("clip", "🎬", "Clip"), ("publish", "📤", "Publish"), ("settings", "⚙️", "Settings")]
 
 
 def make_nav(page):
@@ -401,146 +541,13 @@ def make_nav(page):
                                            for p, _, _ in PAGES]
     return nav
 
-# ---------------------------------------------------------------- look
-_SANS = ["ui-sans-serif", "-apple-system", "Segoe UI Variable Display", "Segoe UI", "Helvetica", "Arial", "sans-serif"]
-THEME = gr.themes.Base(
-    primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.stone,
-    neutral_hue=gr.themes.colors.stone, radius_size=gr.themes.sizes.radius_sm,
-    text_size=gr.themes.sizes.text_md, spacing_size=gr.themes.sizes.spacing_md,
-    font=_SANS, font_mono=["ui-monospace", "SFMono-Regular", "Consolas", "Menlo", "monospace"],
-).set(
-    body_background_fill="#ffffff", body_background_fill_dark="#191919",
-    body_text_color="#37352f", body_text_color_dark="#e3e2e0",
-    body_text_color_subdued="#787774", body_text_color_subdued_dark="#9b9a97",
-    background_fill_primary="#ffffff", background_fill_primary_dark="#191919",
-    background_fill_secondary="#f7f7f5", background_fill_secondary_dark="#202020",
-    block_background_fill="#ffffff", block_background_fill_dark="#191919",
-    block_border_color="#e9e9e7", block_border_color_dark="#2f2f2f", block_border_width="1px",
-    block_shadow="none", block_shadow_dark="none",
-    block_label_background_fill="transparent", block_label_background_fill_dark="transparent",
-    block_label_text_color="#787774", block_label_text_color_dark="#9b9a97",
-    block_label_text_weight="500", block_title_text_weight="500",
-    block_title_text_color="#5f5e5b", block_title_text_color_dark="#b4b3b0",
-    input_background_fill="#fbfbfa", input_background_fill_dark="#202020",
-    input_border_color="#e3e2e0", input_border_color_dark="#373737",
-    input_border_color_focus="#2383e2", input_border_color_focus_dark="#2383e2",
-    input_shadow="none", input_shadow_focus="0 0 0 3px rgb(35 131 226 / 0.18)",
-    border_color_primary="#e9e9e7", border_color_primary_dark="#2f2f2f",
-    button_primary_background_fill="#2383e2", button_primary_background_fill_dark="#2383e2",
-    button_primary_background_fill_hover="#0f75d6", button_primary_background_fill_hover_dark="#3a93ea",
-    button_primary_text_color="#ffffff", button_primary_text_color_dark="#ffffff",
-    button_primary_border_color="#2383e2", button_primary_border_color_dark="#2383e2",
-    button_secondary_background_fill="#ffffff", button_secondary_background_fill_dark="#252525",
-    button_secondary_background_fill_hover="#f1f1ef", button_secondary_background_fill_hover_dark="#2f2f2f",
-    button_secondary_text_color="#37352f", button_secondary_text_color_dark="#e3e2e0",
-    button_secondary_border_color="#dfdfde", button_secondary_border_color_dark="#373737",
-    checkbox_background_color_selected="#2383e2", checkbox_background_color_selected_dark="#2383e2",
-    checkbox_border_color_selected="#2383e2", checkbox_border_color_selected_dark="#2383e2",
-    slider_color="#2383e2", slider_color_dark="#2383e2",
-    color_accent_soft="#f1f1ef", color_accent_soft_dark="#2f2f2f",
-    input_border_width="1px", button_border_width="1px", input_radius="6px",
-    button_large_radius="6px", button_small_radius="6px",
-)
 
-CSS = """
-.gradio-container { max-width: 100% !important; padding: 0 !important; margin: 0 !important; }
-.gradio-container > .main, .gradio-container .main.fillable { max-width: 100% !important; margin: 0 !important; padding: 0 !important; }
-.gradio-container .wrap, .gradio-container .contain { padding: 0 !important; gap: 0 !important; }
-#cf-shell .html-container { padding: 0 !important; }
-footer, .reset-button { display: none !important; }
-
-/* ---- shell: sidebar + page */
-#cf-shell { gap: 0 !important; flex-wrap: nowrap !important; align-items: stretch !important; min-height: 100vh; }
-#cf-side { flex: 0 0 244px !important; min-width: 244px !important; max-width: 244px; background: #f7f7f5;
-  border-right: 1px solid #e9e9e7; padding: 14px 8px 12px !important; gap: 2px !important;
-  position: sticky; top: 0; height: 100vh; align-self: flex-start; overflow-y: auto; }
-.dark #cf-side { background: #202020; border-color: #2f2f2f; }
-#cf-brand { padding: 4px 8px 12px !important; border: none !important; background: transparent !important; }
-#cf-brand .name { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-#cf-brand .mark { width: 22px; height: 22px; border-radius: 5px; background: #37352f; color: #fff;
-  display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; }
-.dark #cf-brand .mark { background: #e3e2e0; color: #191919; }
-#cf-brand .sub { font-size: 12px; color: #91918e; margin: 2px 0 0 30px; }
-button.cf-nav { justify-content: flex-start !important; text-align: left !important; background: transparent !important;
-  border: none !important; box-shadow: none !important; color: #5f5e5b !important; font-weight: 500 !important;
-  font-size: 14px !important; padding: 6px 10px !important; min-height: 32px !important; height: 32px;
-  border-radius: 6px !important; width: 100%; gap: 8px; flex: none !important; }
-button.cf-nav:hover { background: rgb(55 53 47 / 0.06) !important; }
-button.cf-nav.active { background: rgb(55 53 47 / 0.09) !important; color: #37352f !important; font-weight: 600 !important; }
-.dark button.cf-nav { color: #9b9a97 !important; }
-.dark button.cf-nav:hover { background: rgb(255 255 255 / 0.055) !important; }
-.dark button.cf-nav.active { background: rgb(255 255 255 / 0.09) !important; color: #e3e2e0 !important; }
-#cf-side-gap { flex: 1 1 auto !important; min-height: 12px; border: none !important; background: transparent !important; padding: 0 !important; }
-#cf-reset-note { padding: 0 10px !important; border: none !important; background: transparent !important; min-height: 0 !important; }
-#cf-reset-note p { font-size: 12px !important; color: #91918e; margin: 4px 0 0; }
-#cf-main { flex: 1 1 auto !important; min-width: 0 !important; padding: 0 !important; }
-#cf-pages { max-width: 920px; margin: 0 auto !important; padding: 34px 44px 90px !important; border: none !important;
-  background: transparent !important; gap: 0 !important; }
-#cf-pages > .tab-wrapper, #cf-pages > .tab-nav, #cf-pages > div > .tab-container { display: none !important; }
-#cf-pages .tabitem { padding: 0 !important; border: none !important; background: transparent !important; }
-#cf-pages .tabitem > .column, #cf-pages .tabitem > div > .column { gap: 14px !important; }
-
-/* ---- page head */
-.cf-head { padding: 0 !important; border: none !important; background: transparent !important; margin-bottom: 6px; }
-.cf-head .emoji { font-size: 40px; line-height: 1.1; }
-.cf-head h1 { font-size: 32px; font-weight: 700; letter-spacing: -0.01em; margin: 8px 0 4px; color: inherit; }
-.cf-head p { color: #787774; font-size: 15px; margin: 0; }
-
-/* ---- sections */
-.cf-card { border: 1px solid #e9e9e7 !important; border-radius: 8px !important; background: var(--block-background-fill) !important;
-  padding: 18px 20px !important; gap: 14px !important; }
-.dark .cf-card { border-color: #2f2f2f !important; }
-.cf-card .form { border: none !important; background: transparent !important; box-shadow: none !important;
-  gap: 14px !important; overflow: visible !important; }
-.cf-card .block.padded { padding: 0 !important; background: transparent !important; box-shadow: none !important; }
-.cf-card .block { box-shadow: none !important; }
-.cf-card .row { gap: 14px !important; }
-.cf-title { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
-.cf-sub { font-size: 13px; color: #787774; margin: 0 0 4px; }
-.cf-note p { font-size: 13px !important; color: #787774; }
-.cf-note code { font-size: 12px; }
-.cf-actions { gap: 10px !important; margin: 4px 0; justify-content: flex-start !important; flex-wrap: wrap !important; }
-.cf-actions button { height: 38px; font-weight: 600; flex: 0 0 auto !important; min-width: 148px !important;
-  width: auto !important; padding: 0 18px !important; }
-#cf-go { min-width: 200px !important; height: 42px; font-size: 15px; }
-.cf-card button.sm, .cf-card button.secondary { min-height: 32px; }
-.cf-card .row > button.sm { flex: 0 0 auto !important; min-width: 160px !important; width: auto !important; }
-#cf-log textarea, #cf-ytlog textarea, #cf-livelog textarea { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; }
-#cf-live-status { padding: 12px 14px !important; border-radius: 6px !important; background: #f7f7f5 !important; border: none !important; }
-.dark #cf-live-status { background: #202020 !important; }
-#cf-live-status p { margin: 0 0 2px; font-size: 14px; }
-
-/* ---- desktop: the sidebar is pinned to the window and never scrolls away */
-@media (min-width: 821px) {
-  #cf-side { position: fixed !important; top: 0; left: 0; bottom: 0; height: 100vh !important; z-index: 20; }
-  #cf-main { margin-left: 244px !important; }
-}
-
-/* ---- phone: the sidebar becomes a top bar you can swipe */
-@media (max-width: 820px) {
-  #cf-shell { flex-direction: column !important; }
-  #cf-main { padding-top: 50px !important; }
-  #cf-side { position: fixed !important; top: 0; left: 0; right: 0; z-index: 30; height: auto; flex: none !important; min-width: 0 !important;
-    max-width: none; width: 100% !important; flex-direction: row !important; flex-wrap: nowrap !important;
-    overflow-x: auto; overflow-y: hidden; border-right: none; border-bottom: 1px solid #e9e9e7;
-    padding: 8px 10px !important; gap: 4px !important; align-items: center; scrollbar-width: none; }
-  #cf-side::-webkit-scrollbar { display: none; }
-  #cf-brand, #cf-side-gap, #cf-reset-note { display: none !important; }
-  button.cf-nav { width: auto !important; flex: 0 0 auto !important; white-space: nowrap; padding: 6px 10px !important; }
-  #cf-pages { padding: 18px 14px 70px !important; }
-  .cf-head .emoji { font-size: 30px; }
-  .cf-head h1 { font-size: 24px; margin-top: 4px; }
-  .cf-card { padding: 14px !important; }
-  #cf-preview { height: auto !important; max-height: 70vh; }
-}
-"""
-
-
-def card(title=None, sub=None):
-    col = gr.Column(elem_classes="cf-card")
+def card(title=None, sub=None, step=None, visible=True):
+    col = gr.Column(elem_classes="cf-card", visible=visible)
     if title:
         with col:
-            gr.HTML(f'<div class="cf-title">{title}</div>' + (f'<div class="cf-sub">{sub}</div>' if sub else ""))
+            num = f'<span class="cf-step">{step}</span>' if step else ""
+            gr.HTML(f'<div class="cf-title">{num}{title}</div>' + (f'<div class="cf-sub">{sub}</div>' if sub else ""))
     return col
 
 
@@ -551,7 +558,8 @@ def page_head(emoji, title, sub):
 # ---------------------------------------------------------------- layout
 def build():
     s = load_settings()
-    logo_now = s["logo_path"] if s.get("logo_path") and os.path.exists(s["logo_path"]) else ""
+    mode = s.get("mode") if s.get("mode") in ("video", "live") else "video"
+    layout = s.get("layout") if s.get("layout") in dict((v, k) for k, v in LAYOUTS) else "blur"
     games = game_choices()
     split_game_now = s.get("split_game") if s.get("split_game") in [v for _, v in games] else GP.ANY
     w, nav = {}, {}
@@ -563,123 +571,87 @@ def build():
                         '<div class="sub">Shorts from long videos</div>', elem_id="cf-brand")
                 for pid, emoji, label in PAGES:
                     nav[pid] = gr.Button(f"{emoji}  {label}", elem_id=f"nav-{pid}",
-                                         elem_classes=["cf-nav", "active"] if pid == "create" else ["cf-nav"])
+                                         elem_classes=["cf-nav", "active"] if pid == "clip" else ["cf-nav"])
                 gr.HTML("", elem_id="cf-side-gap")
-                reset_btn = gr.Button("↺  Reset all settings", elem_id="nav-reset", elem_classes=["cf-nav"])
-                reset_note = gr.Markdown(elem_id="cf-reset-note")
 
             # ================================================= pages
             with gr.Column(elem_id="cf-main"):
-                with gr.Tabs(elem_id="cf-pages", selected="create") as pages:
-                    # ------------------------------------------------ Create
-                    with gr.Tab("Create", id="create"):
-                        page_head("🎬", "Create", "Turn a finished video into vertical shorts. "
-                                  "Pick the video, press Make clips, and collect the results below.")
-                        with card("Video", "A file on this PC or a YouTube link. Use From / To to clip only part of it."):
-                            w["path_or_url"] = gr.Textbox(label="Full path on this PC, or a YouTube link",
-                                                          placeholder=r"D:\Videos\stream.mp4")
-                            w["upload"] = gr.File(label="Or drop a small video file here", type="filepath",
-                                                  file_types=["video"], height=150)
+                with gr.Tabs(elem_id="cf-pages", selected="clip") as pages:
+                    # ------------------------------------------------ Clip
+                    with gr.Tab("Clip", id="clip"):
+                        page_head("🎬", "Clip", "Turn a video or a live stream into vertical shorts.")
+                        w["mode"] = gr.Radio([("🎬  Video", "video"), ("🔴  Live stream", "live")], value=mode,
+                                             show_label=False, elem_id="cf-mode", container=False)
+
+                        with card("Source", "A file on this PC, a published YouTube link, or a live stream link.",
+                                  step=1):
+                            with gr.Column(visible=mode == "video") as video_src:
+                                w["path_or_url"] = gr.Textbox(label="YouTube link or file path",
+                                                              placeholder=r"https://youtu.be/...   or   D:\Videos\stream.mp4")
+                                w["upload"] = gr.File(label="Or drop a video file here", type="filepath",
+                                                      file_types=["video"], height=120)
+                                with gr.Row():
+                                    w["range_start"] = gr.Textbox(label="From (h:mm:ss, blank = start)",
+                                                                  placeholder="0:00")
+                                    w["range_end"] = gr.Textbox(label="To (blank = end)", placeholder="")
+                            with gr.Column(visible=mode == "live") as live_src:
+                                w["live_url"] = gr.Textbox(label="Live stream link (YouTube, Twitch, Kick...)",
+                                                           placeholder="https://www.youtube.com/live/...")
                             with gr.Row():
-                                w["range_start"] = gr.Textbox(label="From (h:mm:ss, blank = start)",
-                                                              placeholder="2:56:29")
-                                w["range_end"] = gr.Textbox(label="To (blank = end)", placeholder="")
+                                w["content_hint"] = gr.Textbox(label="What is it? (helps the AI)",
+                                                               placeholder="e.g. IShowSpeed playing GTA 6 RP")
+                                w["creator"] = gr.Textbox(label="Creator name (optional)", placeholder="e.g. IShowSpeed")
+
+                        with card("Layout", "How the vertical clip is framed. Load a frame to see a preview.",
+                                  step=2):
+                            w["layout"] = gr.Radio(LAYOUTS, value=layout, show_label=False, elem_id="cf-layout",
+                                                   container=False)
+                            layout_note = gr.Markdown(LAYOUT_NOTES[layout], elem_classes="cf-note")
+                            with gr.Row(elem_classes="cf-actions"):
+                                load_btn = gr.Button("🖼  Load frame", variant="secondary")
+                                next_btn = gr.Button("↻  Another frame", variant="secondary")
+                            w["frame_msg"] = gr.Markdown(elem_classes="cf-note")
+                            with gr.Row(elem_id="cf-frame-row", equal_height=False):
+                                with gr.Column(scale=3, min_width=300):
+                                    w["picker"] = BP.picker(visible=layout == "facecam", elem_id="cf-picker")
+                                    w["zoom"] = gr.Slider(1.0, 1.8, value=s["zoom"], step=0.05,
+                                                          label="Zoom (1.0 = whole frame, higher crops the sides)",
+                                                          visible=layout == "blur")
+                                    w["split_game"] = gr.Dropdown(games, value=split_game_now, label="Gameplay underneath",
+                                                                  visible=layout == "split")
+                                    split_msg = gr.Markdown(split_status() if layout == "split" else "",
+                                                            visible=layout == "split", elem_classes="cf-note")
+                                with gr.Column(scale=2, min_width=200):
+                                    w["layout_preview"] = gr.Image(label="Preview of a clip", interactive=False,
+                                                                   height=460, elem_id="cf-layout-preview",
+                                                                   show_label=True, buttons=[], visible=False)
+                            w["frame"] = gr.State(None)
+
+                        with card("Clips", "How many and how long.", step=3):
                             with gr.Row():
-                                w["content_hint"] = gr.Textbox(label="What is this video?", value=s["content_hint"])
-                                w["creator"] = gr.Textbox(label="Creator name (blank = none)", value=s["creator"])
-                        with card("Clips", "How many to make and how long they can be. Live uses the same lengths."):
-                            with gr.Row():
-                                w["n_clips"] = gr.Slider(1, 30, value=s["n_clips"], step=1, label="Clips")
+                                w["n_clips"] = gr.Slider(1, 30, value=s["n_clips"], step=1, label="Clips per video")
                                 w["min_len"] = gr.Slider(8, 60, value=s["min_len"], step=1, label="Min seconds")
                                 w["max_len"] = gr.Slider(15, 180, value=s["max_len"], step=1, label="Max seconds")
-                            with gr.Row():
+                            with gr.Row(visible=mode == "video") as topn_row:
                                 w["top_n_on"] = gr.Checkbox(label="Also make a Top-N countdown", value=s["top_n_on"])
                                 w["top_n"] = gr.Slider(3, 10, value=s["top_n"], step=1, label="N")
-                        with gr.Row(elem_classes="cf-actions"):
-                            go = gr.Button("Make clips", variant="primary", elem_id="cf-go")
-                        with card("Progress"):
-                            w["log"] = gr.Textbox(show_label=False, lines=10, max_lines=14, autoscroll=True,
-                                                  elem_id="cf-log",
-                                                  placeholder="The log appears here while clips are made.")
-                        with card("Results", "The top clip plays here; every clip has a .txt with its title, caption and keywords."):
-                            with gr.Row():
-                                with gr.Column(scale=2, min_width=240):
-                                    w["preview"] = gr.Video(label="Top clip", height=480, elem_id="cf-preview")
-                                with gr.Column(scale=3, min_width=260):
-                                    w["files"] = gr.Files(label="All clips")
-                                    w["info"] = gr.Markdown(elem_classes="cf-note")
+                            with gr.Column(visible=mode == "live") as live_opts:
+                                with gr.Row():
+                                    w["live_interval"] = gr.Slider(2, 15, value=s["live_interval"], step=1,
+                                                                   label="Check every (minutes)")
+                                    w["live_min_score"] = gr.Slider(50, 95, value=s["live_min_score"], step=1,
+                                                                    label="Minimum score (75-85 works best)")
+                                    w["live_max_clips"] = gr.Slider(1, 5, value=s["live_max_clips"], step=1,
+                                                                    label="Most clips per check")
+                                with gr.Row():
+                                    w["live_chat_on"] = gr.Checkbox(label="Use live chat as a hint", value=s["live_chat_on"])
+                                    w["live_upload"] = gr.Checkbox(label="Upload clips to YouTube as private",
+                                                                   value=s["live_upload"])
+                                    w["live_keep"] = gr.Checkbox(label="Keep the full recording", value=s["live_keep"])
 
-                    # ------------------------------------------------ Live
-                    with gr.Tab("Live", id="live"):
-                        page_head("🔴", "Live", "Watch a stream while it happens. Every few minutes the newest part "
-                                  "is checked (speech + live chat) and viral moments become clips automatically.")
-                        with card("Stream"):
-                            w["live_url"] = gr.Textbox(label="Live stream link (YouTube, Twitch, Kick...)",
-                                                       placeholder="https://www.youtube.com/live/...")
-                            with gr.Row(elem_classes="cf-actions"):
-                                live_go = gr.Button("Start watching", variant="primary", elem_id="cf-live-go")
-                                live_stop_btn = gr.Button("Stop", variant="secondary", interactive=False,
-                                                          elem_id="cf-live-stop")
-                            live_status = gr.Markdown(live_status_text(LIVE.current()), elem_id="cf-live-status")
-                        with card("Checks", "Clips use your Style, Campaign and clip-length settings."):
-                            with gr.Row():
-                                w["live_interval"] = gr.Slider(2, 15, value=s["live_interval"], step=1,
-                                                               label="Check every (minutes)")
-                                w["live_min_score"] = gr.Slider(50, 95, value=s["live_min_score"], step=1,
-                                                                label="Minimum viral score",
-                                                                info="Higher = fewer, stronger clips")
-                                w["live_max_clips"] = gr.Slider(1, 5, value=s["live_max_clips"], step=1,
-                                                                label="Most clips per check")
-                            w["live_chat_on"] = gr.Checkbox(label="Read live chat (YouTube and Twitch)",
-                                                            value=s["live_chat_on"])
-                            w["live_upload"] = gr.Checkbox(label="Upload each clip to YouTube as private "
-                                                                 "(connect on the Publish page)", value=s["live_upload"])
-                            w["live_keep"] = gr.Checkbox(label="Keep the full recording (off = checked parts are "
-                                                               "deleted, only a few minutes stay on disk)",
-                                                         value=s["live_keep"])
-                        with card("Activity"):
-                            live_log = gr.Textbox(show_label=False, lines=12, max_lines=16, autoscroll=True,
-                                                  elem_id="cf-livelog",
-                                                  placeholder="Checks and clips are listed here while a stream is watched.")
-                        with card("Clips from this stream"):
-                            live_files = gr.Files(label="Clips")
-                            live_info = gr.Markdown(elem_classes="cf-note")
-                        live_seen = gr.State("")
-                        live_timer = gr.Timer(2, active=False)
-
-                    # ------------------------------------------------ Style
-                    with gr.Tab("Style", id="style"):
-                        page_head("🎨", "Style", "How every clip looks and sounds. Used by Create and Live.")
-                        with card("Edit formats"):
+                        with gr.Accordion("🎨  Style: formats, captions, sound, motion", open=False, elem_classes="cf-acc"):
                             w["formats"] = gr.CheckboxGroup(list(FORMATS), value=s["formats"],
-                                                            label="Formats the AI may use (it picks the best per clip and keeps them varied)")
-                        with card("Split-screen"):
-                            w["split_on"] = gr.Checkbox(label="Content on top, gameplay underneath",
-                                                        value=s["split_on"])
-                            w["split_game"] = gr.Dropdown(games, value=split_game_now, label="Gameplay",
-                                                          visible=s["split_on"])
-                            w["split_msg"] = gr.Markdown(split_status() if s["split_on"] else "",
-                                                         visible=s["split_on"], elem_classes="cf-note")
-                        with card("Motion graphics"):
-                            w["motion_on"] = gr.Checkbox(label="Animated hooks, cards and stickers (HyperFrames + GSAP)",
-                                                         value=s["motion_on"])
-                            w["motion_elements"] = gr.CheckboxGroup(
-                                [(v, k) for k, v in MOTION_ELEMENTS.items()], value=s["motion_elements"],
-                                label="Animate", visible=s["motion_on"])
-                            w["motion_msg"] = gr.Markdown(motion_status() if s["motion_on"] else "",
-                                                          visible=s["motion_on"], elem_classes="cf-note")
-                        with card("Sound"):
-                            with gr.Row():
-                                w["sfx_on"] = gr.Checkbox(label="Sound effects", value=s["sfx_on"])
-                                w["sfx_gain"] = gr.Slider(0.1, 1.2, value=s["sfx_gain"], step=0.05,
-                                                          label="SFX volume")
-                            with gr.Row():
-                                w["meme_on"] = gr.Checkbox(label="Trending meme sounds", value=s["meme_on"])
-                                w["meme_gain"] = gr.Slider(0.2, 1.5, value=s["meme_gain"], step=0.05,
-                                                           label="Meme volume", visible=s["meme_on"])
-                            w["meme_msg"] = gr.Markdown(meme_status() if s["meme_on"] else "",
-                                                        visible=s["meme_on"], elem_classes="cf-note")
-                        with card("Captions and layout"):
+                                                            label="Edit formats the AI may use (it picks per clip and keeps them varied)")
                             with gr.Row():
                                 w["highlight"] = gr.Dropdown(HIGHLIGHTS, value=s["highlight"],
                                                              label="Caption highlight (auto = varies per clip)")
@@ -690,38 +662,62 @@ def build():
                                 w["progress_on"] = gr.Checkbox(label="Progress bar", value=s["progress_on"])
                                 w["punch_on"] = gr.Checkbox(label="Punch-in zooms", value=s["punch_on"])
                             with gr.Row():
-                                w["layout"] = gr.Radio(["blur", "crop"], value=s["layout"],
-                                                       label="Layout when split-screen is off (blur = whole frame on blurred bg, crop = fill screen)")
-                                w["zoom"] = gr.Slider(1.0, 1.8, value=s["zoom"], step=0.05,
-                                                      label="Zoom (blur layout)")
+                                w["sfx_on"] = gr.Checkbox(label="Sound effects", value=s["sfx_on"])
+                                w["sfx_gain"] = gr.Slider(0.1, 1.2, value=s["sfx_gain"], step=0.05, label="SFX volume")
+                            with gr.Row():
+                                w["meme_on"] = gr.Checkbox(label="Trending meme sounds", value=s["meme_on"])
+                                w["meme_gain"] = gr.Slider(0.2, 1.5, value=s["meme_gain"], step=0.05,
+                                                           label="Meme volume", visible=s["meme_on"])
+                            meme_msg = gr.Markdown(meme_status() if s["meme_on"] else "", visible=s["meme_on"],
+                                                   elem_classes="cf-note")
+                            w["motion_on"] = gr.Checkbox(label="Animated hooks, cards and stickers (motion graphics)",
+                                                         value=s["motion_on"])
+                            w["motion_elements"] = gr.CheckboxGroup(
+                                [(v, k) for k, v in MOTION_ELEMENTS.items()], value=s["motion_elements"],
+                                label="Animate", visible=s["motion_on"])
+                            motion_msg = gr.Markdown(motion_status() if s["motion_on"] else "",
+                                                     visible=s["motion_on"], elem_classes="cf-note")
 
-                    # ------------------------------------------------ Campaign
-                    with gr.Tab("Campaign", id="campaign"):
-                        page_head("📣", "Campaign", "Sponsor logo and campaign rules. Leave both empty for your own clips.")
-                        with card("Sponsor logo", "Shown under the captions on every clip, never on the content. "
-                                  "A PNG with a transparent background looks best."):
+                        with gr.Accordion("📣  Campaign: sponsor logo and rules (optional, this run only)", open=False,
+                                          elem_classes="cf-acc"):
                             with gr.Row():
-                                w["logo_file"] = gr.File(label="Upload logo", file_types=["image"],
-                                                         type="filepath", height=150)
-                                w["logo_preview"] = gr.Image(value=logo_now or None, label="Current logo",
-                                                             interactive=False, height=150)
-                            w["logo_state"] = gr.State(logo_now)
+                                w["logo_file"] = gr.File(label="Sponsor logo (PNG with transparency looks best)",
+                                                         file_types=["image"], type="filepath", height=120)
+                                w["logo_preview"] = gr.Image(label="Current logo", interactive=False, height=120)
+                            w["logo_state"] = gr.State("")
                             with gr.Row():
-                                w["logo_anim"] = gr.Radio(ANIMATIONS, value=s["logo_anim"],
-                                                          label="Logo animation (float = hover, pulse = pop every 3 s)")
-                                w["logo_size"] = gr.Slider(0.5, 1.6, value=s["logo_size"], step=0.05,
-                                                           label="Logo size")
+                                w["logo_anim"] = gr.Radio(ANIMATIONS, value=s["logo_anim"], label="Logo animation")
+                                w["logo_size"] = gr.Slider(0.5, 1.6, value=s["logo_size"], step=0.05, label="Logo size")
                             with gr.Row():
                                 remove_btn = gr.Button("Remove logo", size="sm", variant="secondary")
                                 w["logo_msg"] = gr.Markdown(elem_classes="cf-note")
-                        with card("Campaign rules", "Only clips that pass every rule are made. Rules about what is on "
-                                  "screen can't be checked automatically; they're listed in each clip's .txt."):
-                            w["rules_file"] = gr.File(label="Rules file (.txt .md .pdf .docx)",
-                                                      file_types=[".txt", ".md", ".pdf", ".docx"],
-                                                      type="filepath", height=150)
+                            w["rules_file"] = gr.File(label="Campaign rules file (.txt .md .pdf .docx)",
+                                                      file_types=[".txt", ".md", ".pdf", ".docx"], type="filepath",
+                                                      height=110)
                             w["rules_msg"] = gr.Markdown(elem_classes="cf-note")
-                            w["rules_text"] = gr.Textbox(label="Campaign rules (paste or upload; blank = no campaign)",
-                                                         value=s["rules_text"], lines=8, max_lines=20)
+                            w["rules_text"] = gr.Textbox(label="Campaign rules (only clips that pass every rule are made)",
+                                                         lines=6, max_lines=20, placeholder="Paste the rules, or upload them above.")
+
+                        with gr.Row(elem_id="cf-actionbar"):
+                            start_btn = gr.Button("▶  Start watching" if mode == "live" else "▶  Start clipping",
+                                                  variant="primary", elem_id="cf-start")
+                            stop_btn = gr.Button("■  Stop", variant="secondary", interactive=False, elem_id="cf-stop")
+                            new_btn = gr.Button("↺  New session", variant="secondary", elem_id="cf-new")
+                            status = gr.Markdown(_status_line(None, None), elem_id="cf-status")
+
+                        with card("Progress", visible=False) as progress_col:
+                            log_box = gr.Textbox(show_label=False, lines=9, max_lines=14, autoscroll=True,
+                                                 elem_id="cf-log", placeholder="What ClipForge is doing appears here.")
+                        with card("Results", "Every clip also has a .txt next to it with its title, caption and keywords.",
+                                  visible=False) as results_col:
+                            with gr.Row():
+                                with gr.Column(scale=2, min_width=240):
+                                    video_out = gr.Video(label="Top clip", height=480, elem_id="cf-preview")
+                                with gr.Column(scale=3, min_width=260):
+                                    files_out = gr.Files(label="All clips")
+                                    info_out = gr.Markdown(elem_classes="cf-note")
+                        seen = gr.State("")
+                        timer = gr.Timer(1.0, active=False)
 
                     # ------------------------------------------------ Publish
                     with gr.Tab("Publish", id="publish"):
@@ -732,12 +728,10 @@ def build():
                             with gr.Row(elem_classes="cf-actions"):
                                 yt_connect = gr.Button("Connect YouTube", variant="secondary")
                                 yt_disconnect = gr.Button("Disconnect", variant="secondary")
-                            w["yt_on"] = gr.Checkbox(label="Upload to YouTube when Create finishes",
-                                                     value=s["yt_on"])
-                            w["yt_mode"] = gr.Radio(
-                                [("Private: I review and publish", "review"),
-                                 ("Scheduled: goes public automatically", "scheduled")],
-                                value=s["yt_mode"], label="After upload")
+                            w["yt_on"] = gr.Checkbox(label="Upload to YouTube when a video run finishes", value=s["yt_on"])
+                            w["yt_mode"] = gr.Radio([("Private: I review and publish", "review"),
+                                                     ("Scheduled: goes public automatically", "scheduled")],
+                                                    value=s["yt_mode"], label="After upload")
                             with gr.Row():
                                 w["yt_interval"] = gr.Slider(1, 120, value=s["yt_interval"], step=1,
                                                              label="Minutes between videos (scheduled)")
@@ -745,15 +739,14 @@ def build():
                                                                 label="First one goes public after (min)")
                             w["yt_category"] = gr.Dropdown(list(PUB.CATEGORIES.items()), value=s["yt_category"],
                                                            label="Category")
-                            gr.Markdown("Every video is uploaded **private**, not made for kids, not "
-                                        "age-restricted, with the clip's title, caption and keywords. "
-                                        "Campaign clips and live clips are never scheduled: they wait for your review.",
-                                        elem_classes="cf-note")
+                            yt_save = gr.Button("Save", size="sm", variant="secondary")
+                            gr.Markdown("Every video is uploaded **private**, not made for kids, with the clip's title, "
+                                        "caption and keywords. Campaign and live clips are never scheduled: they wait "
+                                        "for your review.", elem_classes="cf-note")
                         with card("Review queue", "Private videos wait here. Tick the ones you checked and publish them."):
                             q_sum, _, _ = queue_view()
                             yt_queue = gr.Markdown(q_sum, elem_classes="cf-note")
-                            yt_review = gr.CheckboxGroup(choices=PUB.review_list(), value=[],
-                                                         label="Waiting for review")
+                            yt_review = gr.CheckboxGroup(choices=PUB.review_list(), value=[], label="Waiting for review")
                             with gr.Row(elem_classes="cf-actions"):
                                 yt_publish = gr.Button("Publish selected now", variant="primary",
                                                        visible=bool(PUB.review_list()))
@@ -772,83 +765,115 @@ def build():
 
                     # ------------------------------------------------ Settings
                     with gr.Tab("Settings", id="settings"):
-                        page_head("⚙️", "Settings", "Keys and models. Set once and forget.")
+                        page_head("⚙️", "Settings", "Keys, models, storage and phone access. Set once and forget.")
                         with card("AI"):
-                            w["api_key"] = gr.Textbox(label="OpenRouter API key", value=s["api_key"],
-                                                      type="password")
-                            w["model"] = gr.Textbox(label="Model ('auto' = cheapest that works)",
-                                                    value=s["model"])
+                            w["api_key"] = gr.Textbox(label="OpenRouter API key", value=s["api_key"], type="password")
+                            w["model"] = gr.Textbox(label="Model ('auto' = cheapest that works)", value=s["model"])
                             w["allow_free"] = gr.Checkbox(label="Try free models first", value=s["allow_free"])
                         with card("Transcription"):
-                            w["whisper_model"] = gr.Dropdown(STT_CHOICES, value=s["whisper_model"],
-                                                             label="Engine",
+                            w["whisper_model"] = gr.Dropdown(STT_CHOICES, value=s["whisper_model"], label="Engine",
                                                              info="Cloud costs about $0.03-0.22 per hour of audio; local is free but slow.")
                             with gr.Row():
                                 w["fallback_model"] = gr.Dropdown(LOCAL_MODELS, value=s.get("fallback_model") or "small",
                                                                   label="If cloud fails, use local model")
-                                w["language"] = gr.Textbox(label="Language (blank = auto, e.g. en, hi)",
-                                                           value=s["language"])
+                                w["language"] = gr.Textbox(label="Language (blank = auto, e.g. en, hi)", value=s["language"])
+                        ai_save = gr.Button("Save AI and transcription settings", size="sm", variant="secondary")
+                        with card("Storage", "Everything ClipForge makes is temporary."):
+                            storage_md = gr.Markdown(storage_status(), elem_classes="cf-note")
+                            w["keep_days"] = gr.Slider(1, 30, value=s.get("keep_days", 6), step=1,
+                                                       label="Delete clips and temporary files after (days)")
+                            with gr.Row():
+                                clean_btn = gr.Button("Save and clean up now", size="sm", variant="secondary")
+                                clean_msg = gr.Markdown(elem_classes="cf-note")
                         with card("Phone access", "A private link you can open on your phone from anywhere. Login required."):
                             sh_state = gr.Markdown(share_status(), elem_classes="cf-note")
                             sh_on = gr.Checkbox(label="Allow access from my phone (share link with login)",
                                                 value=s["share_on"])
                             with gr.Row():
                                 sh_user = gr.Textbox(label="Username", value=s["share_user"] or "klipr")
-                                sh_pw = gr.Textbox(label="New password (8+ characters; blank = keep)",
-                                                   type="password")
+                                sh_pw = gr.Textbox(label="New password (8+ characters; blank = keep)", type="password")
                             with gr.Row():
                                 sh_save = gr.Button("Save phone access", variant="secondary", size="sm")
                                 sh_msg = gr.Markdown(elem_classes="cf-note")
 
         # ------------------------------------------------ events
-        all_inputs = {w[k] for k in list(SAVED) + ["upload", "path_or_url", "range_start", "range_end",
-                                                   "logo_state", "live_url"]}
         for pid, _, _ in PAGES:
             nav[pid].click(make_nav(pid), None, [pages] + [nav[p] for p, _, _ in PAGES], show_progress="hidden")
-        go.click(make_run(w), all_inputs, [w["log"], w["files"], w["preview"], w["info"]]).then(
-            queue_view, None, [yt_queue, yt_review, yt_publish])
-        live_out = [live_status, live_log, live_files, live_info, live_seen, live_timer, live_go, live_stop_btn]
-        live_go.click(make_live_start(w), all_inputs, live_out)
-        live_stop_btn.click(live_stop, None, live_out)
-        live_timer.tick(live_view, [live_seen], live_out, show_progress="hidden")
-        ui.load(lambda: live_view(""), None, live_out, show_progress="hidden")
-        w["logo_file"].upload(on_logo, [w["logo_file"]], [w["logo_preview"], w["logo_state"], w["logo_msg"]])
-        remove_btn.click(on_remove_logo, None, [w["logo_preview"], w["logo_state"], w["logo_msg"]])
+        nav["publish"].click(queue_view, None, [yt_queue, yt_review, yt_publish], show_progress="hidden")
+        nav["settings"].click(storage_status, None, [storage_md], show_progress="hidden")
+
+        run_out = [status, log_box, files_out, video_out, info_out, seen, timer, start_btn, stop_btn, new_btn,
+                   progress_col, results_col]
+        all_inputs = {w[k] for k in list(PREFS) + list(RUN_FIELDS) + ["picker"] if k in w}
+        start_btn.click(make_start(w), all_inputs, run_out)
+        stop_btn.click(stop_run, None, run_out)
+        timer.tick(view, [seen], run_out, show_progress="hidden")
+        ui.load(lambda: view(""), None, run_out, show_progress="hidden")
+
+        w["mode"].change(on_mode, [w["mode"]], [video_src, live_src, topn_row, live_opts, start_btn])
+        w["mode"].change(lambda m: update_settings(mode=m), [w["mode"]], None)
+        prev_in = [w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_state"], w["logo_size"]]
+        w["layout"].change(on_layout, [w["layout"], w["frame"], w["picker"], w["zoom"], w["logo_state"], w["logo_size"]],
+                           [w["picker"], w["zoom"], w["split_game"], split_msg, layout_note, w["layout_preview"]])
+        frame_in = [w["mode"], w["path_or_url"], w["upload"], w["live_url"], w["frame"], w["picker"], w["layout"],
+                    w["zoom"], w["logo_state"], w["logo_size"]]
+        frame_out = [w["picker"], w["frame"], w["layout_preview"], w["frame_msg"]]
+        load_btn.click(load_frame, frame_in, frame_out)
+        next_btn.click(lambda *a: load_frame(*a, next_one=True), frame_in, frame_out)
+        w["picker"].change(refresh_preview, prev_in, [w["layout_preview"]], show_progress="hidden")
+        w["zoom"].release(refresh_preview, prev_in, [w["layout_preview"]], show_progress="hidden")
+        w["logo_size"].release(refresh_preview, prev_in, [w["layout_preview"]], show_progress="hidden")
+
+        w["logo_file"].upload(on_logo, [w["logo_file"], w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_size"]],
+                              [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"]])
+        remove_btn.click(on_remove_logo, [w["frame"], w["picker"], w["layout"], w["zoom"], w["logo_size"]],
+                         [w["logo_preview"], w["logo_state"], w["logo_msg"], w["layout_preview"]])
         w["rules_file"].upload(on_rules_file, [w["rules_file"]], [w["rules_text"], w["rules_msg"]])
-        w["motion_on"].change(on_motion, [w["motion_on"]], [w["motion_elements"], w["motion_msg"]])
-        w["meme_on"].change(on_meme, [w["meme_on"]], [w["meme_gain"], w["meme_msg"]])
-        w["split_on"].change(on_split, [w["split_on"]], [w["split_game"], w["split_msg"]])
-        sh_save.click(on_share, [sh_on, sh_user, sh_pw], [sh_msg, sh_state]).then(
-            lambda: "", None, [sh_pw])
+        w["motion_on"].change(on_motion, [w["motion_on"]], [w["motion_elements"], motion_msg])
+        w["meme_on"].change(on_meme, [w["meme_on"]], [w["meme_gain"], meme_msg])
+
+        order = list(w)
+        new_btn.click(make_new_session(w, order), None, [w[k] for k in order] + run_out)
+
+        yt_keys = ["yt_on"] + YT_KEYS
+        yt_save.click(lambda *v: save_prefs(*v, keys=yt_keys), [w[k] for k in yt_keys], None).then(
+            lambda: gr.Info("Saved."), None, None)
+        ai_keys = ["api_key", "model", "allow_free", "whisper_model", "fallback_model", "language"]
+        ai_save.click(lambda *v: save_prefs(*v, keys=ai_keys), [w[k] for k in ai_keys], None).then(
+            lambda: gr.Info("Saved."), None, None)
+        clean_btn.click(on_clean, [w["keep_days"]], [clean_msg, storage_md])
+        sh_save.click(on_share, [sh_on, sh_user, sh_pw], [sh_msg, sh_state]).then(lambda: "", None, [sh_pw])
         yt_connect.click(on_connect, None, [yt_state])
         yt_disconnect.click(on_disconnect, None, [yt_state])
         tg_test.click(on_test_telegram, [w["telegram_token"], w["telegram_chat"]], [tg_msg])
         yt_refresh.click(queue_view, None, [yt_queue, yt_review, yt_publish])
         yt_upload.click(on_upload_queue, [w[k] for k in YT_KEYS], [yt_log, yt_queue, yt_review, yt_publish])
         yt_publish.click(on_publish, [yt_review], [yt_log, yt_queue, yt_review, yt_publish])
-        nav["publish"].click(queue_view, None, [yt_queue, yt_review, yt_publish], show_progress="hidden")
-        order = [k for k in w]
-        reset_btn.click(make_reset(w, order), None, [w[k] for k in order] + [reset_note])
     return ui
 
 
-if __name__ == "__main__":
+def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
     os.makedirs(GP.GAMEPLAY_DIR, exist_ok=True)
     s = load_settings()
+    save_settings(s)                               # drops old run inputs from settings.json
+    try:
+        remove_logo()                              # a sponsor logo belongs to one run
+    except Exception:
+        pass
+    threading.Thread(target=lambda: storage.clean(s.get("keep_days", 6), log=print), daemon=True).start()
     share, why = RM.ready(s)
     if why:
         print("\n" + why + " Set a password in Settings > Phone access.\n")
     kw = {}
+    share_errors = []
     if share:
         kw = {"share": True, "auth": RM.make_auth(s.get("share_user") or "klipr", s["share_hash"]),
               "auth_message": "ClipForge: sign in"}
-    share_errors = []
-    if share:
         RM.retry_share_tunnel(share_errors)
     ui = build().queue()
-    ui.launch(inbrowser=True, allowed_paths=[OUTPUT_DIR, ASSETS_DIR], theme=THEME, css=CSS,
+    ui.launch(inbrowser=True, allowed_paths=[OUTPUT_DIR, ASSETS_DIR, FR.FRAMES_DIR], theme=THEME, css=CSS,
               prevent_thread_lock=True, **kw)
     if share:
         url = getattr(ui, "share_url", None)
@@ -866,3 +891,7 @@ if __name__ == "__main__":
         ui.block_thread()
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    main()

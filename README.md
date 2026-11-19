@@ -9,13 +9,53 @@ hook text, original sound effects, viral titles + post captions.
 3. Get an OpenRouter key at https://openrouter.ai/keys
 
 ## Use
-- **run.bat** → opens the app in your browser. Paste your key in *Settings* once.
-  For big files paste the full path (e.g. `D:\Videos\stream.mp4`) instead of uploading.
-- **batch.bat** → drag a folder of videos onto it; clips every video with your last settings.
-- **From / To** (h:mm:ss) clips only part of a video. With a YouTube link only that part is
-  downloaded. Leave both blank for the whole video.
-- **Reset** puts every setting back to the default and clears the logo, rules and last
-  results. Your API key, cached transcripts and finished clips are kept.
+**run.bat** opens the app in your browser. Paste your OpenRouter key in *Settings* once.
+Everything for a run is on the **Clip** page, top to bottom:
+1. **Video | Live stream** switch at the top.
+2. **Source**: a YouTube link or a file path (for big files paste the path, e.g.
+   `D:\Videos\stream.mp4`, instead of uploading) - or, in Live mode, the stream's link.
+   **From / To** (h:mm:ss) clips only part of a video; with a link only that part is downloaded.
+3. **Layout** (see below). **Load frame** shows a frame of the video and a preview of a clip.
+4. **Clips**: how many and how long (Live: how often to check and the minimum score).
+5. **Style** and **Campaign** are folded away: formats, captions, sounds, motion graphics,
+   sponsor logo, campaign rules.
+6. **Start**. **Stop** ends a run at once, in both modes. **New session** clears everything from
+   the last run: the link, description, creator, boxes, logo, rules, log and results.
+   Run inputs are never saved, so the app also starts clean every time. Preferences (keys,
+   style, clip lengths, layout type) are kept.
+
+**batch.bat**: drag a folder of videos onto it; clips every video with your preferences
+(`python cli.py --help` for the options: logo, rules, facecam boxes, ...).
+
+## Layouts
+| Layout | What a clip looks like |
+|---|---|
+| **Facecam + gameplay** | For streams. You draw two boxes on a frame: the streamer's camera and the game. The camera fills the top, the game the bottom, captions sit on the line between them; hook text, stickers and a sponsor logo go on the game, never on the face. The **Facecam size** slider sets how much of the height the camera gets (25-55%). Each box is locked to the shape of the space it fills, so nothing is ever stretched. Works in Live mode too (the frame is taken from the stream as it is live). |
+| **Full frame** | The whole video, nothing cut off, on a blurred copy of itself. Zoom above 1.0 crops the sides. |
+| **Fill screen** | Fills the vertical screen by cutting off the sides. |
+| **Split with gameplay** | The video on top, a muted gameplay video (from the `gameplay` folder) underneath. |
+
+A tiny facecam (e.g. 320x180 in a 1080p stream) is enlarged to the full width and looks soft:
+ClipForge uses the best upscaler ffmpeg has, but it can't add detail that isn't there.
+
+## How moments are picked
+The AI is briefed on why people watch a clip: a hook in the first 3 seconds, real stakes, a
+genuine emotional peak from the streamer, a payoff inside the clip, no context needed, and a
+reason to share. Every clip is scored on those parts (hook 25, emotion 25, payoff 20,
+context 15, share 15) and names its trigger ("near-miss escape", "rage after a betrayal"...),
+written in the clip's .txt. Generic laughing, inside jokes, donation reading, greeting chat,
+menus and dead air are rejected.
+The streamer is the main signal: what they say (exclamations, swearing, current slang like
+"ain't no way", "he's cooked", "chat is this real") and how (lines said much louder than their
+normal voice, rapid panicked talk, stunned silences). Live chat is only a weak hint: greetings
+are ignored, W/L and emote spam count little, copypasta bursts are discounted, and a moment is
+never picked because of chat alone.
+
+## Storage
+Everything ClipForge makes is temporary: clips, downloads, transcripts, motion graphics and
+live recordings older than **6 days** (Settings → Storage) are deleted automatically when the
+app starts and after every run. A clip still waiting in the YouTube upload queue is kept until
+it is uploaded. Settings → Storage shows how much space is used and can clean up right away.
 
 Output: `output\<video name>\<date_time>\`
 - `clip_01_<title>.mp4` … ranked best first
@@ -121,13 +161,13 @@ bottom half, captions on the line between them. Turn it on in **Style**, or
 - Only use this for campaigns that allow outside footage. Many don't (e.g. "only footage
   from the official folder"). Use gameplay you recorded or have the rights to.
 
-## Live streams (the Live page)
-Paste a live stream link and press **Start watching**. ClipForge records the stream while it
-happens and, every 5 minutes (you choose), checks the newest part:
-- the speech is transcribed and the **live chat** is read (YouTube and Twitch); a burst of chat
-  messages is the strongest sign that something just happened;
-- the AI only picks moments above the **minimum viral score**; most checks find nothing, and
-  that's normal;
+## Live streams (Live mode)
+Switch to **Live stream**, paste the link and press **Start watching**. ClipForge records the
+stream while it happens and, every 5 minutes (you choose), checks the newest part:
+- the speech is transcribed and the streamer's words and voice are analysed; the **live chat**
+  (YouTube and Twitch) is read as a weak extra hint;
+- the AI only picks moments above the **minimum score** (75-85 works best; 95 means almost
+  nothing qualifies); most checks find nothing, and that's normal;
 - each clip is made with your Style / Campaign settings, uploaded to YouTube as **private**
   (if YouTube is connected) and announced on Telegram. Publish it from the Publish page.
 - Each check re-reads about a minute of the previous one, so a moment that crosses two checks
@@ -135,7 +175,8 @@ happens and, every 5 minutes (you choose), checks the newest part:
 - Checked parts of the recording are deleted straight away: only a few minutes of video are on
   disk at any time. Tick **Keep the full recording** to save the whole stream instead.
 - If the stream hasn't started yet, ClipForge waits for it. When the stream ends, it does a
-  last check and stops by itself. The PC must stay on and online the whole time.
+  last check and stops by itself. **Stop** ends it at once instead (a check in progress is
+  abandoned; footage not checked yet is skipped). The PC must stay on and online the whole time.
 - Clips appear 1-7 minutes after the moment (the wait for the next check + rendering).
 - Batch mode: `python cli.py --live https://www.youtube.com/live/...`
 Only clip streams you're allowed to clip (your campaign's creators, or your own).
@@ -203,12 +244,16 @@ your local fallback model, so a run never stops because of it.
 ## Code map
 | File | What it does |
 |---|---|
-| `app.py` | The web app (Gradio): pages, buttons, settings form |
+| `app.py` | The web app (Gradio): the Clip page, Publish, Settings; runs in the background with Stop |
+| `ui/boxpicker.py` | The facecam / gameplay box picker (drag, resize, draw; shapes locked) |
+| `ui/theme.py` | Look of the app (theme + CSS) |
 | `cli.py` | Batch mode / command line (`batch.bat`) |
 | `cf/pipeline.py` | `process()`: one video in, finished clips out. Calls everything below, step by step |
 | `cf/live.py` | Live-stream monitor: recorder, periodic checks, cleanup |
 | `cf/chat.py` | Live chat readers (YouTube, Twitch) and chat-burst detection |
 | `cf/download.py` | Downloading videos with yt-dlp |
+| `cf/frames.py` | A frame of a file / link / live stream, and the layout preview |
+| `cf/storage.py` | Deletes clips and temporary files after N days; disk usage |
 | `cf/audio.py` | Audio extraction and wav reading |
 | `cf/transcribe.py`, `cf/cloud_stt.py` | Speech-to-text: cloud Whisper, local fallback |
 | `cf/hype.py`, `cf/signals.py` | Loud spikes and reaction signals (exclaims, laughs, pauses, fast talk) |
@@ -224,4 +269,4 @@ your local fallback model, so a run never stops because of it.
 | `cf/publish.py` | YouTube upload queue + Telegram messages |
 | `cf/remote.py` | Phone access (share link + login) |
 | `cf/settings.py` | Saved settings and their defaults |
-| `cf/tools.py` | Shared helpers: folders, ffmpeg, Node.js, JSON files, time formats |
+| `cf/tools.py` | Shared helpers: stopping a run, folders, ffmpeg, Node.js, JSON files, time formats |
