@@ -270,3 +270,6 @@ your local fallback model, so a run never stops because of it.
 | `cf/remote.py` | Phone access (share link + login) |
 | `cf/settings.py` | Saved settings and their defaults |
 | `cf/tools.py` | Shared helpers: stopping a run, folders, ffmpeg, Node.js, JSON files, time formats |
+
+
+OFF CAMPUS CODE: RKJMJQ
